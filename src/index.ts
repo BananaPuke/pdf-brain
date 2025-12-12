@@ -289,6 +289,12 @@ export class PDFLibrary extends Effect.Service<PDFLibrary>()("PDFLibrary", {
             libraryPath: config.libraryPath,
           };
         }),
+
+      /**
+       * Repair database integrity issues
+       * Removes orphaned chunks and embeddings
+       */
+      repair: () => db.repair(),
     };
   }),
   dependencies: [OllamaLive, PDFExtractorLive, DatabaseLive],

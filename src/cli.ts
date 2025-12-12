@@ -85,6 +85,9 @@ Commands:
 
   check                   Check if Ollama is ready
 
+  repair                  Fix database integrity issues
+                          Removes orphaned chunks/embeddings
+
   migrate                 Database migration utilities
     --check               Check if migration is needed
     --import <file>       Import from SQL dump file
@@ -319,6 +322,38 @@ const program = Effect.gen(function* () {
     case "check": {
       yield* library.checkReady();
       yield* Console.log("✓ Ollama is ready");
+      break;
+    }
+
+    case "repair": {
+      yield* Console.log("Checking database integrity...\n");
+      const result = yield* library.repair();
+
+      if (
+        result.orphanedChunks === 0 &&
+        result.orphanedEmbeddings === 0 &&
+        result.zeroVectorEmbeddings === 0
+      ) {
+        yield* Console.log("✓ Database is healthy - no repairs needed");
+      } else {
+        yield* Console.log("Repairs completed:");
+        if (result.orphanedChunks > 0) {
+          yield* Console.log(
+            `  • Removed ${result.orphanedChunks} orphaned chunks`,
+          );
+        }
+        if (result.orphanedEmbeddings > 0) {
+          yield* Console.log(
+            `  • Removed ${result.orphanedEmbeddings} orphaned embeddings`,
+          );
+        }
+        if (result.zeroVectorEmbeddings > 0) {
+          yield* Console.log(
+            `  • Removed ${result.zeroVectorEmbeddings} zero-dimension embeddings`,
+          );
+        }
+        yield* Console.log("\n✓ Database repaired");
+      }
       break;
     }
 

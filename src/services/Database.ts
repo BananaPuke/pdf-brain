@@ -76,6 +76,16 @@ export class Database extends Context.Tag("Database")<
       { documents: number; chunks: number; embeddings: number },
       DatabaseError
     >;
+
+    // Maintenance
+    readonly repair: () => Effect.Effect<
+      {
+        orphanedChunks: number;
+        orphanedEmbeddings: number;
+        zeroVectorEmbeddings: number;
+      },
+      DatabaseError
+    >;
   }
 >() {}
 
@@ -460,6 +470,70 @@ export const DatabaseLive = Layer.scoped(
               embeddings: Number(
                 (embeddings.rows[0] as { count: number }).count,
               ),
+            };
+          },
+          catch: (e) => new DatabaseError({ reason: String(e) }),
+        }),
+
+      repair: () =>
+        Effect.tryPromise({
+          try: async () => {
+            // Count orphaned chunks (doc_id not in documents)
+            const orphanedChunksResult = await db.query(`
+              SELECT COUNT(*) as count FROM chunks c
+              WHERE NOT EXISTS (SELECT 1 FROM documents d WHERE d.id = c.doc_id)
+            `);
+            const orphanedChunks = Number(
+              (orphanedChunksResult.rows[0] as { count: number }).count,
+            );
+
+            // Count orphaned embeddings (chunk_id not in chunks)
+            const orphanedEmbeddingsResult = await db.query(`
+              SELECT COUNT(*) as count FROM embeddings e
+              WHERE NOT EXISTS (SELECT 1 FROM chunks c WHERE c.id = e.chunk_id)
+            `);
+            const orphanedEmbeddings = Number(
+              (orphanedEmbeddingsResult.rows[0] as { count: number }).count,
+            );
+
+            // Count zero-dimension embeddings (vector_dims returns 0 or null)
+            // Note: In pgvector, we check for malformed vectors
+            const zeroVectorResult = await db.query(`
+              SELECT COUNT(*) as count FROM embeddings 
+              WHERE embedding IS NULL OR vector_dims(embedding) = 0
+            `);
+            const zeroVectorEmbeddings = Number(
+              (zeroVectorResult.rows[0] as { count: number }).count,
+            );
+
+            // Delete orphaned embeddings first (depends on chunks)
+            if (orphanedEmbeddings > 0) {
+              await db.query(`
+                DELETE FROM embeddings e
+                WHERE NOT EXISTS (SELECT 1 FROM chunks c WHERE c.id = e.chunk_id)
+              `);
+            }
+
+            // Delete orphaned chunks (depends on documents)
+            if (orphanedChunks > 0) {
+              await db.query(`
+                DELETE FROM chunks c
+                WHERE NOT EXISTS (SELECT 1 FROM documents d WHERE d.id = c.doc_id)
+              `);
+            }
+
+            // Delete zero-dimension embeddings
+            if (zeroVectorEmbeddings > 0) {
+              await db.query(`
+                DELETE FROM embeddings 
+                WHERE embedding IS NULL OR vector_dims(embedding) = 0
+              `);
+            }
+
+            return {
+              orphanedChunks,
+              orphanedEmbeddings,
+              zeroVectorEmbeddings,
             };
           },
           catch: (e) => new DatabaseError({ reason: String(e) }),
