@@ -26,3 +26,4 @@ dist/
 *.test.pdf
 postgres.data
 vector.tar.gz
+*.tar.gz

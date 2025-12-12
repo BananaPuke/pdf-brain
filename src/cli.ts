@@ -88,6 +88,12 @@ Commands:
   repair                  Fix database integrity issues
                           Removes orphaned chunks/embeddings
 
+  export                  Export library database for sharing
+    --output <path>       Output file (default: ./pdf-library-export.tar.gz)
+
+  import <file>           Import library database from export
+    --force               Overwrite existing library
+
   migrate                 Database migration utilities
     --check               Check if migration is needed
     --import <file>       Import from SQL dump file
@@ -357,6 +363,103 @@ const program = Effect.gen(function* () {
       break;
     }
 
+    case "export": {
+      const opts = parseArgs(args.slice(1));
+      const config = LibraryConfig.fromEnv();
+      const outputPath =
+        (opts.output as string) ||
+        join(process.cwd(), "pdf-library-export.tar.gz");
+
+      yield* Console.log(`Exporting library database...`);
+      yield* Console.log(`  Source: ${config.libraryPath}/library`);
+      yield* Console.log(`  Output: ${outputPath}`);
+
+      // Get stats first
+      const stats = yield* library.stats();
+      yield* Console.log(
+        `  Contents: ${stats.documents} docs, ${stats.chunks} chunks, ${stats.embeddings} embeddings`,
+      );
+
+      // Use tar to create archive
+      const tarResult = Bun.spawnSync(
+        ["tar", "-czf", outputPath, "-C", config.libraryPath, "library"],
+        { stdout: "pipe", stderr: "pipe" },
+      );
+      if (tarResult.exitCode !== 0) {
+        const stderr = tarResult.stderr.toString();
+        yield* Console.error(`Export failed: ${stderr}`);
+        process.exit(1);
+      }
+
+      // Get file size
+      const fileSize = Bun.file(outputPath).size;
+      const sizeMB = (fileSize / 1024 / 1024).toFixed(1);
+
+      yield* Console.log(`\n✓ Exported to ${outputPath} (${sizeMB} MB)`);
+      yield* Console.log(`\nTo import on another machine:`);
+      yield* Console.log(`  pdf-brain import ${basename(outputPath)}`);
+      break;
+    }
+
+    case "import": {
+      const importFile = args[1];
+      if (!importFile) {
+        yield* Console.error("Error: Import file required");
+        yield* Console.error("Usage: pdf-brain import <file.tar.gz> [--force]");
+        process.exit(1);
+      }
+
+      if (!existsSync(importFile)) {
+        yield* Console.error(`Error: File not found: ${importFile}`);
+        process.exit(1);
+      }
+
+      const opts = parseArgs(args.slice(2));
+      const config = LibraryConfig.fromEnv();
+      const libraryDir = join(config.libraryPath, "library");
+
+      // Check if library already exists
+      if (existsSync(libraryDir) && !opts.force) {
+        yield* Console.error(`Error: Library already exists at ${libraryDir}`);
+        yield* Console.error("Use --force to overwrite");
+        process.exit(1);
+      }
+
+      yield* Console.log(`Importing library database...`);
+      yield* Console.log(`  Source: ${importFile}`);
+      yield* Console.log(`  Target: ${config.libraryPath}`);
+
+      // Ensure parent directory exists
+      if (!existsSync(config.libraryPath)) {
+        mkdirSync(config.libraryPath, { recursive: true });
+      }
+
+      // Remove existing if force
+      if (existsSync(libraryDir) && opts.force) {
+        yield* Console.log(`  Removing existing library...`);
+        const rmResult = Bun.spawnSync(["rm", "-rf", libraryDir]);
+        if (rmResult.exitCode !== 0) {
+          yield* Console.error("Failed to remove existing library");
+          process.exit(1);
+        }
+      }
+
+      // Extract archive
+      const tarResult = Bun.spawnSync(
+        ["tar", "-xzf", importFile, "-C", config.libraryPath],
+        { stdout: "pipe", stderr: "pipe" },
+      );
+      if (tarResult.exitCode !== 0) {
+        const stderr = tarResult.stderr.toString();
+        yield* Console.error(`Import failed: ${stderr}`);
+        process.exit(1);
+      }
+
+      yield* Console.log(`\n✓ Library imported successfully`);
+      yield* Console.log(`\nRun 'pdf-brain stats' to verify`);
+      break;
+    }
+
     default:
       yield* Console.error(`Unknown command: ${command}`);
       yield* Console.log(HELP);
@@ -421,17 +524,18 @@ if (args[0] === "migrate") {
   Effect.runPromise(
     program.pipe(
       Effect.provide(PDFLibraryLive),
-      Effect.catchAll((error) =>
+      Effect.catchAll((error: unknown) =>
         Effect.gen(function* () {
-          // Check if it's a database initialization error
+          const errorObj = error as { _tag?: string };
           const errorStr = JSON.stringify(error);
+          // Check if it's a database initialization error
           if (
             errorStr.includes("PGlite") ||
             errorStr.includes("version") ||
             errorStr.includes("incompatible")
           ) {
             yield* Console.error(
-              `Database Error: ${error._tag}: ${JSON.stringify(error)}`,
+              `Database Error: ${errorObj._tag || "Unknown"}: ${errorStr}`,
             );
             yield* Console.error(
               "\nThis may be a database version compatibility issue.",
@@ -441,7 +545,7 @@ if (args[0] === "migrate") {
             );
           } else {
             yield* Console.error(
-              `Error: ${error._tag}: ${JSON.stringify(error)}`,
+              `Error: ${errorObj._tag || "Unknown"}: ${errorStr}`,
             );
           }
           process.exit(1);
