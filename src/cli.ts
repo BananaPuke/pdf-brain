@@ -131,60 +131,69 @@ function downloadFile(url: string, destPath: string) {
 }
 
 const HELP = `
-pdf-library - Local PDF and Markdown knowledge base with vector search
+                 ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+                 ┃                                                ┃
+    ██████╗      ┃   Local knowledge base with vector search      ┃
+    ██╔══██╗     ┃   ─────────────────────────────────────────    ┃
+    ██████╔╝     ┃   PDFs & Markdown → Chunks → Embeddings        ┃
+    ██╔═══╝      ┃   Powered by PGlite + pgvector + Ollama        ┃
+    ██║          ┃                                                ┃
+    ╚═╝  BRAIN   ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
 
 Usage:
-  pdf-library <command> [options]
+  pdf-brain <command> [options]
 
 Commands:
-  add <path|url>          Add a PDF or Markdown file to the library (supports URLs)
-    --title <title>       Custom title (default: filename)
+  add <path|url>          Add a PDF or Markdown file (local path or URL)
+    --title <title>       Custom title (default: filename or frontmatter)
     --tags <tags>         Comma-separated tags
 
   search <query>          Semantic search across all documents
     --limit <n>           Max results (default: 10)
     --tag <tag>           Filter by tag
-    --fts                 Full-text search only (no embeddings)
-    --expand <chars>      Expand context around matches (default: 0, max: 4000)
+    --fts                 Full-text search only (skip embeddings)
+    --expand <chars>      Expand context around matches (max: 4000)
+                          Returns surrounding chunks up to char budget
 
-  list                    List all documents
+  list                    List all documents in the library
     --tag <tag>           Filter by tag
 
-  get <id|title>          Get document details
+  read <id|title>         Get document details and metadata
 
-  remove <id|title>       Remove a document
+  remove <id|title>       Remove a document from the library
 
   tag <id|title> <tags>   Set tags on a document
 
   stats                   Show library statistics
+                          Documents, chunks, embeddings count
 
-  check                   Check if Ollama is ready
+  check                   Verify Ollama is running and model available
 
   repair                  Fix database integrity issues
                           Removes orphaned chunks/embeddings
 
-  export                  Export library database for sharing
-    --output <path>       Output file (default: ./pdf-library-export.tar.gz)
+  export                  Export library for backup or sharing
+    --output <path>       Output file (default: ./pdf-brain-export.tar.gz)
 
-  import <file>           Import library database from export
+  import <file>           Import library from export archive
     --force               Overwrite existing library
 
   migrate                 Database migration utilities
     --check               Check if migration is needed
-    --import <file>       Import from SQL dump file
-    --generate-script     Generate export script for current database
+    --import <file>       Import from SQL dump
+    --generate-script     Generate export script for current DB
 
 Options:
   --help, -h              Show this help
+  --version, -v           Show version
 
 Examples:
-  pdf-library add ./book.pdf --tags "programming,rust"
-  pdf-library add ./notes.md --tags "documentation,api"
-  pdf-library add https://example.com/paper.pdf --title "Research Paper"
-  pdf-library add https://raw.githubusercontent.com/user/repo/main/README.md
-  pdf-library search "machine learning" --limit 5
-  pdf-library migrate --check
-  pdf-library migrate --import backup.sql
+  pdf-brain add ./book.pdf --tags "programming,rust"
+  pdf-brain add ./notes.md --tags "docs,api"
+  pdf-brain add https://example.com/paper.pdf --title "Research Paper"
+  pdf-brain search "machine learning" --limit 5
+  pdf-brain search "error handling" --expand 2000
+  pdf-brain stats
 `;
 
 function parseArgs(args: string[]) {
@@ -209,11 +218,18 @@ function parseArgs(args: string[]) {
   return result;
 }
 
+const VERSION = "0.6.0";
+
 const program = Effect.gen(function* () {
   const args = process.argv.slice(2);
 
   if (args.length === 0 || args.includes("--help") || args.includes("-h")) {
     yield* Console.log(HELP);
+    return;
+  }
+
+  if (args.includes("--version") || args.includes("-v")) {
+    yield* Console.log(`pdf-brain v${VERSION}`);
     return;
   }
 
@@ -265,13 +281,13 @@ const program = Effect.gen(function* () {
       yield* Console.log(`Adding: ${localPath}`);
       const doc = yield* library.add(
         localPath,
-        new AddOptions({ title, tags }),
+        new AddOptions({ title, tags })
       );
       yield* Console.log(`✓ Added: ${doc.title}`);
       yield* Console.log(`  ID: ${doc.id}`);
       yield* Console.log(`  Pages: ${doc.pageCount}`);
       yield* Console.log(
-        `  Size: ${(doc.sizeBytes / 1024 / 1024).toFixed(2)} MB`,
+        `  Size: ${(doc.sizeBytes / 1024 / 1024).toFixed(2)} MB`
       );
       if (doc.tags.length) yield* Console.log(`  Tags: ${doc.tags.join(", ")}`);
       break;
@@ -293,14 +309,16 @@ const program = Effect.gen(function* () {
         : 0;
 
       yield* Console.log(
-        `Searching: "${query}"${ftsOnly ? " (FTS only)" : ""}${expandChars > 0 ? ` (expand: ${expandChars} chars)` : ""}\n`,
+        `Searching: "${query}"${ftsOnly ? " (FTS only)" : ""}${
+          expandChars > 0 ? ` (expand: ${expandChars} chars)` : ""
+        }\n`
       );
 
       const results = ftsOnly
         ? yield* library.ftsSearch(query, new SearchOptions({ limit, tags }))
         : yield* library.search(
             query,
-            new SearchOptions({ limit, tags, hybrid: true, expandChars }),
+            new SearchOptions({ limit, tags, hybrid: true, expandChars })
           );
 
       if (results.length === 0) {
@@ -308,7 +326,7 @@ const program = Effect.gen(function* () {
       } else {
         for (const r of results) {
           yield* Console.log(
-            `[${r.score.toFixed(3)}] ${r.title} (p.${r.page})`,
+            `[${r.score.toFixed(3)}] ${r.title} (p.${r.page})`
           );
 
           if (r.expandedContent && expandChars > 0) {
@@ -322,7 +340,7 @@ const program = Effect.gen(function* () {
           } else {
             // Default: truncated snippet
             yield* Console.log(
-              `  ${r.content.slice(0, 200).replace(/\n/g, " ")}...`,
+              `  ${r.content.slice(0, 200).replace(/\n/g, " ")}...`
             );
           }
           yield* Console.log("");
@@ -339,7 +357,7 @@ const program = Effect.gen(function* () {
 
       if (docs.length === 0) {
         yield* Console.log(
-          tag ? `No documents with tag "${tag}"` : "Library is empty",
+          tag ? `No documents with tag "${tag}"` : "Library is empty"
         );
       } else {
         yield* Console.log(`Documents: ${docs.length}\n`);
@@ -352,6 +370,7 @@ const program = Effect.gen(function* () {
       break;
     }
 
+    case "read":
     case "get": {
       const id = args[1];
       if (!id) {
@@ -370,11 +389,11 @@ const program = Effect.gen(function* () {
       yield* Console.log(`Path: ${doc.path}`);
       yield* Console.log(`Pages: ${doc.pageCount}`);
       yield* Console.log(
-        `Size: ${(doc.sizeBytes / 1024 / 1024).toFixed(2)} MB`,
+        `Size: ${(doc.sizeBytes / 1024 / 1024).toFixed(2)} MB`
       );
       yield* Console.log(`Added: ${doc.addedAt}`);
       yield* Console.log(
-        `Tags: ${doc.tags.length ? doc.tags.join(", ") : "(none)"}`,
+        `Tags: ${doc.tags.length ? doc.tags.join(", ") : "(none)"}`
       );
       break;
     }
@@ -402,7 +421,7 @@ const program = Effect.gen(function* () {
       const tagList = tags.split(",").map((t) => t.trim());
       const doc = yield* library.tag(id, tagList);
       yield* Console.log(
-        `✓ Updated tags for "${doc.title}": ${tagList.join(", ")}`,
+        `✓ Updated tags for "${doc.title}": ${tagList.join(", ")}`
       );
       break;
     }
@@ -438,17 +457,17 @@ const program = Effect.gen(function* () {
         yield* Console.log("Repairs completed:");
         if (result.orphanedChunks > 0) {
           yield* Console.log(
-            `  • Removed ${result.orphanedChunks} orphaned chunks`,
+            `  • Removed ${result.orphanedChunks} orphaned chunks`
           );
         }
         if (result.orphanedEmbeddings > 0) {
           yield* Console.log(
-            `  • Removed ${result.orphanedEmbeddings} orphaned embeddings`,
+            `  • Removed ${result.orphanedEmbeddings} orphaned embeddings`
           );
         }
         if (result.zeroVectorEmbeddings > 0) {
           yield* Console.log(
-            `  • Removed ${result.zeroVectorEmbeddings} zero-dimension embeddings`,
+            `  • Removed ${result.zeroVectorEmbeddings} zero-dimension embeddings`
           );
         }
         yield* Console.log("\n✓ Database repaired");
@@ -461,7 +480,7 @@ const program = Effect.gen(function* () {
       const config = LibraryConfig.fromEnv();
       const outputPath =
         (opts.output as string) ||
-        join(process.cwd(), "pdf-library-export.tar.gz");
+        join(process.cwd(), "pdf-brain-export.tar.gz");
 
       yield* Console.log(`Exporting library database...`);
       yield* Console.log(`  Source: ${config.libraryPath}/library`);
@@ -470,13 +489,13 @@ const program = Effect.gen(function* () {
       // Get stats first
       const stats = yield* library.stats();
       yield* Console.log(
-        `  Contents: ${stats.documents} docs, ${stats.chunks} chunks, ${stats.embeddings} embeddings`,
+        `  Contents: ${stats.documents} docs, ${stats.chunks} chunks, ${stats.embeddings} embeddings`
       );
 
       // Use tar to create archive
       const tarResult = Bun.spawnSync(
         ["tar", "-czf", outputPath, "-C", config.libraryPath, "library"],
-        { stdout: "pipe", stderr: "pipe" },
+        { stdout: "pipe", stderr: "pipe" }
       );
       if (tarResult.exitCode !== 0) {
         const stderr = tarResult.stderr.toString();
@@ -540,7 +559,7 @@ const program = Effect.gen(function* () {
       // Extract archive
       const tarResult = Bun.spawnSync(
         ["tar", "-xzf", importFile, "-C", config.libraryPath],
-        { stdout: "pipe", stderr: "pipe" },
+        { stdout: "pipe", stderr: "pipe" }
       );
       if (tarResult.exitCode !== 0) {
         const stderr = tarResult.stderr.toString();
@@ -574,7 +593,7 @@ if (args[0] === "migrate") {
       const needed = yield* migration.checkMigrationNeeded(dbPath);
       if (needed) {
         yield* Console.log(
-          "Migration needed:\n" + migration.getMigrationMessage(),
+          "Migration needed:\n" + migration.getMigrationMessage()
         );
       } else {
         yield* Console.log("✓ No migration needed - database is compatible");
@@ -604,13 +623,13 @@ if (args[0] === "migrate") {
             yield* Console.error(`Migration Error: ${error.message}`);
           } else {
             yield* Console.error(
-              `Error: ${error._tag}: ${JSON.stringify(error)}`,
+              `Error: ${error._tag}: ${JSON.stringify(error)}`
             );
           }
           process.exit(1);
-        }),
-      ),
-    ),
+        })
+      )
+    )
   );
 } else {
   // Run with error handling
@@ -628,22 +647,22 @@ if (args[0] === "migrate") {
             errorStr.includes("incompatible")
           ) {
             yield* Console.error(
-              `Database Error: ${errorObj._tag || "Unknown"}: ${errorStr}`,
+              `Database Error: ${errorObj._tag || "Unknown"}: ${errorStr}`
             );
             yield* Console.error(
-              "\nThis may be a database version compatibility issue.",
+              "\nThis may be a database version compatibility issue."
             );
             yield* Console.error(
-              "Run 'pdf-library migrate --check' to diagnose.",
+              "Run 'pdf-brain migrate --check' to diagnose."
             );
           } else {
             yield* Console.error(
-              `Error: ${errorObj._tag || "Unknown"}: ${errorStr}`,
+              `Error: ${errorObj._tag || "Unknown"}: ${errorStr}`
             );
           }
           process.exit(1);
-        }),
-      ),
-    ),
+        })
+      )
+    )
   );
 }
