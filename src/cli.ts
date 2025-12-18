@@ -1,11 +1,18 @@
 #!/usr/bin/env bun
 /**
- * PDF Library CLI
+ * PDF Brain CLI
  */
 
 import { Effect, Console } from "effect";
-import { mkdirSync, existsSync } from "fs";
-import { basename, extname, join } from "path";
+import { mkdirSync, existsSync, readFileSync } from "fs";
+import { basename, extname, join, dirname } from "path";
+import { fileURLToPath } from "url";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const pkg = JSON.parse(
+  readFileSync(join(__dirname, "..", "package.json"), "utf-8")
+);
+const VERSION = pkg.version;
 import {
   PDFLibrary,
   PDFLibraryLive,
@@ -217,8 +224,6 @@ function parseArgs(args: string[]) {
   }
   return result;
 }
-
-const VERSION = "0.6.1";
 
 const program = Effect.gen(function* () {
   const args = process.argv.slice(2);
