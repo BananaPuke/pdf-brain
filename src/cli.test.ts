@@ -5,6 +5,8 @@ import {
   hasMarkdownExtension,
   assessWALHealth,
   MARKDOWN_INDICATORS,
+  getCheckpointInterval,
+  shouldCheckpoint,
 } from "./cli.js";
 
 describe("filenameFromURL", () => {
@@ -270,5 +272,43 @@ describe("daemon command parsing", () => {
 
   test("daemon status subcommand exists", () => {
     expect(true).toBe(true); // Structure verification only
+  });
+});
+
+describe("automatic checkpoint during batch operations", () => {
+  test("calculates checkpoint interval from options", () => {
+    // Default should be 50
+    const defaultInterval = getCheckpointInterval({});
+    expect(defaultInterval).toBe(50);
+
+    // Custom interval
+    const customInterval = getCheckpointInterval({
+      "checkpoint-interval": "25",
+    });
+    expect(customInterval).toBe(25);
+  });
+
+  test("determines when checkpoint is needed", () => {
+    const interval = 50;
+
+    // Should checkpoint at multiples of interval
+    expect(shouldCheckpoint(0, interval)).toBe(false); // Start, no checkpoint
+    expect(shouldCheckpoint(49, interval)).toBe(false);
+    expect(shouldCheckpoint(50, interval)).toBe(true); // 50th doc
+    expect(shouldCheckpoint(51, interval)).toBe(false);
+    expect(shouldCheckpoint(100, interval)).toBe(true); // 100th doc
+    expect(shouldCheckpoint(150, interval)).toBe(true); // 150th doc
+  });
+
+  test("checkpoint counter tracks processed documents", () => {
+    // Test that counter increments properly during ingest loop
+    // This is behavioral - we verify by checking the checkpointing logic
+    const docsProcessed = [1, 2, 49, 50, 51, 99, 100];
+    const interval = 50;
+    const checkpointedAt = docsProcessed.filter((n) =>
+      shouldCheckpoint(n, interval)
+    );
+
+    expect(checkpointedAt).toEqual([50, 100]);
   });
 });

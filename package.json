@@ -46,6 +46,7 @@
     "@types/bun": "latest",
     "@types/mdast": "^4.0.4",
     "@types/react": "^19.2.7",
+    "react-devtools-core": "^7.0.1",
     "typescript": "^5.7.2"
   },
   "peerDependencies": {

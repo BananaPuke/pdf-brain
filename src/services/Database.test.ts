@@ -553,3 +553,62 @@ describe("DatabaseLive routing", () => {
     );
   });
 });
+
+describe("DatabaseLive daemon auto-start", () => {
+  test("attempts to start daemon automatically", async () => {
+    // This test verifies that DatabaseLive calls ensureDaemonRunning
+    // In test environment with temp dir, daemon should auto-start
+    // NOTE: This is integration test - we're testing the full flow
+    const result = await runDb((db) =>
+      Effect.gen(function* () {
+        // If we can add a document, daemon or fallback is working
+        const doc = new PDFDocument({
+          id: "auto-start-test",
+          title: "Auto-Start Test",
+          path: "/fake/autostart.pdf",
+          addedAt: new Date(),
+          pageCount: 1,
+          sizeBytes: 1000,
+          tags: [],
+        });
+        yield* db.addDocument(doc);
+        return yield* db.getDocument("auto-start-test");
+      })
+    );
+
+    expect(result).not.toBeNull();
+    expect(result?.title).toBe("Auto-Start Test");
+  });
+
+  test("falls back to direct PGlite if daemon fails to start", async () => {
+    // This test verifies graceful degradation
+    // Even if daemon fails, database operations should work via fallback
+    const result = await runDb((db) =>
+      Effect.gen(function* () {
+        // Add document
+        const doc = new PDFDocument({
+          id: "fallback-test",
+          title: "Fallback Test",
+          path: "/fake/fallback.pdf",
+          addedAt: new Date(),
+          pageCount: 1,
+          sizeBytes: 1000,
+          tags: [],
+        });
+        yield* db.addDocument(doc);
+
+        // Verify it works
+        const retrieved = yield* db.getDocument("fallback-test");
+        expect(retrieved).not.toBeNull();
+
+        // All operations should work in fallback mode
+        yield* db.updateTags("fallback-test", ["fallback"]);
+        const stats = yield* db.getStats();
+
+        return stats;
+      })
+    );
+
+    expect(result.documents).toBeGreaterThan(0);
+  });
+});

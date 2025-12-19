@@ -31,6 +31,9 @@ export interface IngestState {
   errors: FileStatus[];
   startTime: number;
   endTime?: number;
+  checkpointInProgress?: boolean;
+  checkpointMessage?: string;
+  lastCheckpointAt?: number;
 }
 
 /** Props for the IngestProgress component */
@@ -208,6 +211,22 @@ export function IngestProgress({ state, onCancel }: IngestProgressProps) {
             {state.currentFile.chunks && (
               <Text color="gray"> ({state.currentFile.chunks} chunks)</Text>
             )}
+          </Text>
+        </Box>
+      )}
+
+      {/* Checkpoint indicator */}
+      {state.checkpointInProgress && state.checkpointMessage && (
+        <Box marginBottom={1}>
+          <Text color="magenta">
+            <Spinner type="dots" /> {state.checkpointMessage}
+          </Text>
+        </Box>
+      )}
+      {state.lastCheckpointAt && !state.checkpointInProgress && (
+        <Box marginBottom={1}>
+          <Text color="gray">
+            Last checkpoint: {state.lastCheckpointAt} docs
           </Text>
         </Box>
       )}

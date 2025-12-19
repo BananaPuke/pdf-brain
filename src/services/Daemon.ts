@@ -244,3 +244,80 @@ export async function isDaemonRunning(config: DaemonConfig): Promise<boolean> {
     return false;
   }
 }
+
+/**
+ * Result of ensuring daemon is running
+ *
+ * Represents the outcome of attempting to start the daemon.
+ * Used by DatabaseLive to decide routing strategy.
+ */
+export interface EnsureDaemonResult {
+  /** Whether daemon is available for use */
+  success: boolean;
+  /** Connection mode: 'daemon' if daemon running, 'fallback' if using direct PGlite */
+  mode: "daemon" | "fallback";
+  /** Error message if daemon failed to start (only present when mode='fallback') */
+  error?: string;
+}
+
+/**
+ * Ensure daemon is running - auto-start if not running
+ *
+ * **DAEMON-FIRST ARCHITECTURE**: This is the entry point for making daemon
+ * the default mode. Every database operation goes through this function.
+ *
+ * Flow:
+ * 1. Check if daemon already running (fast path - no startup cost)
+ * 2. If not running, attempt to start daemon in background
+ * 3. If start succeeds → return success with mode='daemon'
+ * 4. If start fails → return fallback mode (caller uses direct PGlite)
+ *
+ * **Graceful Degradation**: This function NEVER throws. If daemon can't start,
+ * it returns a fallback result, allowing the caller to fall back to direct PGlite.
+ * This ensures the application always works, even if daemon is unavailable.
+ *
+ * **Why auto-start?**
+ * - Solves PGlite's single-connection limitation by default
+ * - No manual `pdf-brain daemon start` required
+ * - Multi-process safety out of the box
+ * - Graceful fallback preserves single-process simplicity when needed
+ *
+ * @param config - Daemon configuration (socket path, PID path, DB path)
+ * @returns Result indicating daemon status and mode
+ *
+ * @example
+ * ```typescript
+ * const result = await ensureDaemonRunning(config);
+ * if (result.success) {
+ *   // Use DatabaseClient (Unix socket connection)
+ *   console.log("Using daemon mode - multi-process safe");
+ * } else {
+ *   // Use direct PGlite (fallback)
+ *   console.warn(`Daemon failed: ${result.error}`);
+ *   console.log("Using direct PGlite - single process only");
+ * }
+ * ```
+ */
+export async function ensureDaemonRunning(
+  config: DaemonConfig
+): Promise<EnsureDaemonResult> {
+  // Fast path: check if already running
+  if (await isDaemonRunning(config)) {
+    return { success: true, mode: "daemon" };
+  }
+
+  // Daemon not running - try to start it
+  try {
+    await startDaemon(config);
+    return { success: true, mode: "daemon" };
+  } catch (error) {
+    // Daemon failed to start - return fallback mode
+    // This is graceful degradation, not a failure
+    // Caller can fall back to direct PGlite
+    return {
+      success: false,
+      mode: "fallback",
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}

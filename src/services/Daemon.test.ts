@@ -155,4 +155,61 @@ describe("Daemon Service", () => {
       await stopDaemon(config);
     });
   });
+
+  describe("auto-start daemon (ensureDaemonRunning)", () => {
+    test("does nothing if daemon already running", async () => {
+      // RED: This test should fail because ensureDaemonRunning doesn't exist yet
+      const { ensureDaemonRunning } = await import("./Daemon.js");
+
+      await startDaemon(config);
+      const wasRunningBefore = await isDaemonRunning(config);
+
+      // Should not throw when daemon already running
+      await ensureDaemonRunning(config);
+
+      const wasRunningAfter = await isDaemonRunning(config);
+      expect(wasRunningBefore).toBe(true);
+      expect(wasRunningAfter).toBe(true);
+    });
+
+    test("starts daemon if not running", async () => {
+      // RED: This test should fail because ensureDaemonRunning doesn't exist yet
+      const { ensureDaemonRunning } = await import("./Daemon.js");
+
+      expect(await isDaemonRunning(config)).toBe(false);
+
+      await ensureDaemonRunning(config);
+
+      expect(await isDaemonRunning(config)).toBe(true);
+    });
+
+    test("returns success when daemon starts successfully", async () => {
+      // RED: This test should fail - return type doesn't exist yet
+      const { ensureDaemonRunning } = await import("./Daemon.js");
+
+      const result = await ensureDaemonRunning(config);
+
+      expect(result.success).toBe(true);
+      expect(result.mode).toBe("daemon");
+      expect(await isDaemonRunning(config)).toBe(true);
+    });
+
+    test("returns fallback when daemon fails to start", async () => {
+      // RED: This test should fail - graceful fallback doesn't exist yet
+      const { ensureDaemonRunning } = await import("./Daemon.js");
+
+      // Corrupt the config to force daemon start failure
+      const badConfig = {
+        ...config,
+        dbPath: "/this/path/cannot/exist/without/permissions",
+      };
+
+      const result = await ensureDaemonRunning(badConfig);
+
+      // Should return fallback mode, not throw
+      expect(result.success).toBe(false);
+      expect(result.mode).toBe("fallback");
+      expect(result.error).toBeDefined();
+    });
+  });
 });

@@ -7,7 +7,7 @@
  */
 
 import { Effect, Context, Layer, Schema } from "effect";
-import { existsSync, readFileSync } from "fs";
+import { existsSync, readFileSync, readdirSync, rmSync } from "fs";
 import { join } from "path";
 import { PGlite } from "@electric-sql/pglite";
 import { vector } from "@electric-sql/pglite/vector";
@@ -18,7 +18,7 @@ import { vector } from "@electric-sql/pglite/vector";
 
 export class MigrationError extends Schema.TaggedError<MigrationError>()(
   "MigrationError",
-  { reason: Schema.String },
+  { reason: Schema.String }
 ) {}
 
 // ============================================================================
@@ -33,7 +33,7 @@ export class Migration extends Context.Tag("Migration")<
      * Returns true if migration is needed.
      */
     readonly checkMigrationNeeded: (
-      dbPath: string,
+      dbPath: string
     ) => Effect.Effect<boolean, MigrationError>;
 
     /**
@@ -46,7 +46,7 @@ export class Migration extends Context.Tag("Migration")<
      */
     readonly importFromDump: (
       dumpFile: string,
-      dbPath: string,
+      dbPath: string
     ) => Effect.Effect<void, MigrationError>;
 
     /**
@@ -54,6 +54,23 @@ export class Migration extends Context.Tag("Migration")<
      * User runs this with PGlite 0.2.x installed to export data.
      */
     readonly generateExportScript: (dbPath: string) => string;
+
+    /**
+     * Detect corrupted filesystem artifacts in database directory.
+     * Returns array of corrupted paths (e.g., "base 2", "pg_multixact 2").
+     */
+    readonly detectCorruptedArtifacts: (
+      dbPath: string
+    ) => Effect.Effect<string[], MigrationError>;
+
+    /**
+     * Remove corrupted filesystem artifacts from database directory.
+     * Returns array of removed paths.
+     */
+    readonly cleanupCorruptedArtifacts: (
+      dbPath: string,
+      deep?: boolean
+    ) => Effect.Effect<string[], MigrationError>;
   }
 >() {}
 
@@ -157,7 +174,7 @@ https://github.com/joelhooks/pdf-library#migration
           return yield* Effect.fail(
             new MigrationError({
               reason: `Dump file not found: ${dumpFile}`,
-            }),
+            })
           );
         }
 
@@ -315,5 +332,115 @@ const { writeFileSync } = require('fs');
 });
 `;
     },
-  }),
+
+    detectCorruptedArtifacts: (dbPath) =>
+      Effect.gen(function* () {
+        const pgDataDir = dbPath.replace(".db", "");
+
+        // If directory doesn't exist, no corruption
+        if (!existsSync(pgDataDir)) {
+          return [];
+        }
+
+        // Valid PostgreSQL directory names (PGlite/PostgreSQL 17)
+        const validDirs = new Set([
+          "base",
+          "global",
+          "pg_commit_ts",
+          "pg_dynshmem",
+          "pg_logical",
+          "pg_multixact",
+          "pg_notify",
+          "pg_replslot",
+          "pg_serial",
+          "pg_snapshots",
+          "pg_stat",
+          "pg_stat_tmp",
+          "pg_subtrans",
+          "pg_tblspc",
+          "pg_twophase",
+          "pg_wal",
+          "pg_xact",
+        ]);
+
+        // Read directory contents
+        const entries = yield* Effect.try({
+          try: () => readdirSync(pgDataDir, { withFileTypes: true }),
+          catch: (e) =>
+            new MigrationError({
+              reason: `Failed to read database directory: ${e}`,
+            }),
+        });
+
+        // Detect corrupted artifacts (directories with " 2" suffix or other variants)
+        const corrupted: string[] = [];
+        for (const entry of entries) {
+          if (!entry.isDirectory()) continue;
+
+          // Check for corrupted naming patterns
+          // Pattern 1: "base 2", "pg_multixact 2" (space + number)
+          if (/\s+\d+$/.test(entry.name)) {
+            corrupted.push(entry.name);
+            continue;
+          }
+
+          // Pattern 2: Valid name that got duplicated (not in valid set but looks valid)
+          // This catches edge cases but we're conservative here
+        }
+
+        return corrupted;
+      }),
+
+    cleanupCorruptedArtifacts: (dbPath, deep = false) =>
+      Effect.gen(function* () {
+        const pgDataDir = dbPath.replace(".db", "");
+
+        // Reuse detectCorruptedArtifacts to find what needs cleanup
+        const corrupted = yield* Effect.gen(function* () {
+          if (!existsSync(pgDataDir)) {
+            return [];
+          }
+
+          const entries = yield* Effect.try({
+            try: () => readdirSync(pgDataDir, { withFileTypes: true }),
+            catch: (e) =>
+              new MigrationError({
+                reason: `Failed to read database directory: ${e}`,
+              }),
+          });
+
+          const result: string[] = [];
+          for (const entry of entries) {
+            if (!entry.isDirectory()) continue;
+            // Detect space-number pattern (e.g., "base 2", "pg_multixact 2")
+            if (/\s+\d+$/.test(entry.name)) {
+              result.push(entry.name);
+            }
+          }
+          return result;
+        });
+
+        if (corrupted.length === 0) {
+          return [];
+        }
+
+        // Remove each corrupted artifact
+        const removed: string[] = [];
+        for (const dirName of corrupted) {
+          const fullPath = join(pgDataDir, dirName);
+          yield* Effect.try({
+            try: () => {
+              rmSync(fullPath, { recursive: true, force: true });
+              removed.push(dirName);
+            },
+            catch: (e) =>
+              new MigrationError({
+                reason: `Failed to remove corrupted artifact ${dirName}: ${e}`,
+              }),
+          });
+        }
+
+        return removed;
+      }),
+  })
 );

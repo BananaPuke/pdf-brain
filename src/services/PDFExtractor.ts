@@ -35,10 +35,10 @@ export class PDFExtractor extends Context.Tag("PDFExtractor")<
   PDFExtractor,
   {
     readonly extract: (
-      path: string,
+      path: string
     ) => Effect.Effect<ExtractedPDF, PDFExtractionError | PDFNotFoundError>;
     readonly process: (
-      path: string,
+      path: string
     ) => Effect.Effect<
       { pageCount: number; chunks: ProcessedChunk[] },
       PDFExtractionError | PDFNotFoundError
@@ -65,17 +65,25 @@ print(json.dumps({"pageCount": len(reader.pages), "pages": pages}))
 `;
 
 /**
+ * Sanitize text by removing null bytes that crash PostgreSQL TEXT columns
+ */
+export function sanitizeText(text: string): string {
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: intentionally stripping null bytes
+  return text.replace(/\x00/g, "");
+}
+
+/**
  * Chunk text with intelligent splitting
  */
 function chunkText(
   text: string,
   chunkSize: number,
-  chunkOverlap: number,
+  chunkOverlap: number
 ): string[] {
   const chunks: string[] = [];
 
-  // Clean up text
-  const cleaned = text
+  // Clean up text - sanitize first, then normalize whitespace
+  const cleaned = sanitizeText(text)
     .replace(/\s+/g, " ")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
@@ -151,7 +159,7 @@ export const PDFExtractorLive = Layer.effect(
 
           if (!existsSync(resolvedPath)) {
             return yield* Effect.fail(
-              new PDFNotFoundError({ path: resolvedPath }),
+              new PDFNotFoundError({ path: resolvedPath })
             );
           }
 
@@ -176,7 +184,7 @@ export const PDFExtractorLive = Layer.effect(
 
           if (!existsSync(resolvedPath)) {
             return yield* Effect.fail(
-              new PDFNotFoundError({ path: resolvedPath }),
+              new PDFNotFoundError({ path: resolvedPath })
             );
           }
 
@@ -196,7 +204,7 @@ export const PDFExtractorLive = Layer.effect(
             const pageChunks = chunkText(
               text,
               config.chunkSize,
-              config.chunkOverlap,
+              config.chunkOverlap
             );
             pageChunks.forEach((content, chunkIndex) => {
               allChunks.push({ page, chunkIndex, content });
@@ -206,5 +214,5 @@ export const PDFExtractorLive = Layer.effect(
           return { pageCount: extracted.pageCount, chunks: allChunks };
         }),
     };
-  }),
+  })
 );

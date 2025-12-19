@@ -22,12 +22,12 @@ import { LibraryConfig } from "../types.js";
 
 export class MarkdownNotFoundError extends Schema.TaggedError<MarkdownNotFoundError>()(
   "MarkdownNotFoundError",
-  { path: Schema.String },
+  { path: Schema.String }
 ) {}
 
 export class MarkdownExtractionError extends Schema.TaggedError<MarkdownExtractionError>()(
   "MarkdownExtractionError",
-  { path: Schema.String, reason: Schema.String },
+  { path: Schema.String, reason: Schema.String }
 ) {}
 
 // ============================================================================
@@ -83,7 +83,7 @@ export class MarkdownExtractor extends Context.Tag("MarkdownExtractor")<
      * Extract markdown into sections with frontmatter
      */
     readonly extract: (
-      path: string,
+      path: string
     ) => Effect.Effect<
       ExtractedMarkdown,
       MarkdownExtractionError | MarkdownNotFoundError
@@ -92,9 +92,7 @@ export class MarkdownExtractor extends Context.Tag("MarkdownExtractor")<
     /**
      * Process markdown into chunks suitable for embedding
      */
-    readonly process: (
-      path: string,
-    ) => Effect.Effect<
+    readonly process: (path: string) => Effect.Effect<
       {
         pageCount: number;
         chunks: ProcessedChunk[];
@@ -107,7 +105,7 @@ export class MarkdownExtractor extends Context.Tag("MarkdownExtractor")<
      * Extract frontmatter only (fast path for title extraction)
      */
     readonly extractFrontmatter: (
-      path: string,
+      path: string
     ) => Effect.Effect<
       MarkdownFrontmatter,
       MarkdownExtractionError | MarkdownNotFoundError
@@ -118,6 +116,14 @@ export class MarkdownExtractor extends Context.Tag("MarkdownExtractor")<
 // ============================================================================
 // Implementation
 // ============================================================================
+
+/**
+ * Sanitize text by removing null bytes that crash PostgreSQL TEXT columns
+ */
+export function sanitizeText(text: string): string {
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: intentionally stripping null bytes
+  return text.replace(/\x00/g, "");
+}
 
 /**
  * Create unified processor with remark plugins
@@ -237,17 +243,23 @@ function extractFrontmatterData(content: string): MarkdownFrontmatter {
 function chunkText(
   text: string,
   chunkSize: number,
-  chunkOverlap: number,
+  chunkOverlap: number
 ): string[] {
   const chunks: string[] = [];
 
+  // Sanitize first to remove null bytes
+  const sanitized = sanitizeText(text);
+
   // Preserve code blocks - extract them first
   const codeBlocks: { placeholder: string; content: string }[] = [];
-  const processedText = text.replace(/```[\s\S]*?```|`[^`]+`/g, (match) => {
-    const placeholder = `__CODE_BLOCK_${codeBlocks.length}__`;
-    codeBlocks.push({ placeholder, content: match });
-    return placeholder;
-  });
+  const processedText = sanitized.replace(
+    /```[\s\S]*?```|`[^`]+`/g,
+    (match) => {
+      const placeholder = `__CODE_BLOCK_${codeBlocks.length}__`;
+      codeBlocks.push({ placeholder, content: match });
+      return placeholder;
+    }
+  );
 
   // Clean up excessive whitespace while preserving paragraph breaks
   const cleaned = processedText
@@ -351,7 +363,7 @@ export const MarkdownExtractorLive = Layer.effect(
 
           if (!existsSync(resolvedPath)) {
             return yield* Effect.fail(
-              new MarkdownNotFoundError({ path: resolvedPath }),
+              new MarkdownNotFoundError({ path: resolvedPath })
             );
           }
 
@@ -383,7 +395,7 @@ export const MarkdownExtractorLive = Layer.effect(
 
           if (!existsSync(resolvedPath)) {
             return yield* Effect.fail(
-              new MarkdownNotFoundError({ path: resolvedPath }),
+              new MarkdownNotFoundError({ path: resolvedPath })
             );
           }
 
@@ -410,7 +422,7 @@ export const MarkdownExtractorLive = Layer.effect(
             const sectionChunks = chunkText(
               sectionContent,
               config.chunkSize,
-              config.chunkOverlap,
+              config.chunkOverlap
             );
             sectionChunks.forEach((content, chunkIndex) => {
               allChunks.push({
@@ -434,7 +446,7 @@ export const MarkdownExtractorLive = Layer.effect(
 
           if (!existsSync(resolvedPath)) {
             return yield* Effect.fail(
-              new MarkdownNotFoundError({ path: resolvedPath }),
+              new MarkdownNotFoundError({ path: resolvedPath })
             );
           }
 
@@ -453,5 +465,5 @@ export const MarkdownExtractorLive = Layer.effect(
           return result;
         }),
     };
-  }),
+  })
 );

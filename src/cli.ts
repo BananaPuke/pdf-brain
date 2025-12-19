@@ -4,7 +4,14 @@
  */
 
 import { Effect, Console, Layer } from "effect";
-import { mkdirSync, existsSync, readFileSync, readdirSync, statSync } from "fs";
+import {
+  mkdirSync,
+  existsSync,
+  readFileSync,
+  readdirSync,
+  statSync,
+  rmSync,
+} from "fs";
 import { basename, extname, join, dirname } from "path";
 import { fileURLToPath } from "url";
 import {
@@ -142,6 +149,132 @@ export function assessWALHealth(stats: {
 }
 
 /**
+ * Corrupted directories check result
+ */
+export interface CorruptedDirsResult {
+  healthy: boolean;
+  issues: string[];
+}
+
+/**
+ * Check for corrupted directories (directories with " 2" suffix)
+ * Known corruption patterns: "base 2", "pg_multixact 2"
+ */
+export function checkCorruptedDirs(
+  libraryPath: string,
+  dirs: string[]
+): CorruptedDirsResult {
+  const corrupted = dirs.filter((d) => d.endsWith(" 2"));
+  return {
+    healthy: corrupted.length === 0,
+    issues: corrupted,
+  };
+}
+
+/**
+ * Overall doctor health assessment result
+ */
+export interface DoctorHealthResult {
+  healthy: boolean;
+  checks: HealthCheck[];
+}
+
+export interface HealthCheck {
+  name: string;
+  healthy: boolean;
+  details?: string;
+}
+
+/**
+ * Assess overall doctor health from individual checks
+ */
+export function assessDoctorHealth(data: {
+  walHealth: WALHealthResult;
+  corruptedDirs: CorruptedDirsResult;
+  daemonRunning: boolean;
+  ollamaReachable: boolean;
+  orphanedData: { chunks: number; embeddings: number };
+}): DoctorHealthResult {
+  const checks: HealthCheck[] = [];
+
+  // WAL health check
+  checks.push({
+    name: "WAL Files",
+    healthy: data.walHealth.healthy,
+    details:
+      data.walHealth.warnings.length > 0
+        ? data.walHealth.warnings.join("; ")
+        : undefined,
+  });
+
+  // Corrupted directories check
+  checks.push({
+    name: "Corrupted Directories",
+    healthy: data.corruptedDirs.healthy,
+    details:
+      data.corruptedDirs.issues.length > 0
+        ? `Found: ${data.corruptedDirs.issues.join(", ")}`
+        : undefined,
+  });
+
+  // Daemon check
+  checks.push({
+    name: "Daemon",
+    healthy: data.daemonRunning,
+    details: data.daemonRunning ? undefined : "Not running",
+  });
+
+  // Ollama check
+  checks.push({
+    name: "Ollama",
+    healthy: data.ollamaReachable,
+    details: data.ollamaReachable ? undefined : "Unreachable",
+  });
+
+  // Orphaned data check
+  const hasOrphans =
+    data.orphanedData.chunks > 0 || data.orphanedData.embeddings > 0;
+  checks.push({
+    name: "Orphaned Data",
+    healthy: !hasOrphans,
+    details: hasOrphans
+      ? `${data.orphanedData.chunks} chunks, ${data.orphanedData.embeddings} embeddings`
+      : undefined,
+  });
+
+  return {
+    healthy: checks.every((c) => c.healthy),
+    checks,
+  };
+}
+
+/**
+ * Get checkpoint interval from CLI options
+ * Default is 50 documents
+ */
+export function getCheckpointInterval(
+  opts: Record<string, string | boolean>
+): number {
+  const interval = opts["checkpoint-interval"];
+  if (typeof interval === "string") {
+    const parsed = parseInt(interval, 10);
+    return isNaN(parsed) || parsed <= 0 ? 50 : parsed;
+  }
+  return 50; // Default
+}
+
+/**
+ * Determine if checkpoint should be triggered at this document count
+ * Checkpoints at every N documents (e.g., 50, 100, 150...)
+ */
+export function shouldCheckpoint(
+  processedCount: number,
+  interval: number
+): boolean {
+  return processedCount > 0 && processedCount % interval === 0;
+}
+
+/**
  * Download a file (PDF or Markdown) from URL to local path
  */
 function downloadFile(url: string, destPath: string) {
@@ -235,8 +368,8 @@ Commands:
 
   check                   Verify Ollama is running and model available
 
-  doctor                  Check WAL health and database status
-                           Warns if WAL files accumulate excessively
+  doctor                  Comprehensive health check (WAL, corrupted dirs, daemon, Ollama, orphaned data)
+    --fix                 Auto-repair detected issues
 
   repair                  Fix database integrity issues
                            Removes orphaned chunks/embeddings
@@ -251,6 +384,7 @@ Commands:
     --auto-tag            Auto-generate tags using LLM (local first)
     --enrich              Full enrichment: title, summary, tags (slower)
     --sample <n>          Process only first N files (for testing)
+    --checkpoint-interval <n>  Checkpoint every N docs (default: 50)
     --no-tui              Disable TUI, use simple progress output
 
   export                  Export library for backup or sharing
@@ -520,60 +654,174 @@ const program = Effect.gen(function* () {
     }
 
     case "doctor": {
+      const opts = parseArgs(args.slice(1));
+      const shouldFix = opts.fix === true;
       const config = LibraryConfig.fromEnv();
-      const walPath = join(config.libraryPath, "library", "pg_wal");
+      const libraryPath = join(config.libraryPath, "library");
+      const walPath = join(libraryPath, "pg_wal");
 
-      yield* Console.log("Checking database health...\n");
+      yield* Console.log("🔍 Checking database health...\n");
 
-      // Check if WAL directory exists
-      if (!existsSync(walPath)) {
-        yield* Console.log(
-          "✓ WAL directory not found (database not initialized yet)"
-        );
+      // Check if library directory exists
+      if (!existsSync(libraryPath)) {
+        yield* Console.log("✓ Library not initialized yet (nothing to check)");
         break;
       }
 
-      // Count WAL files and total size
-      const walFiles = readdirSync(walPath).filter(
-        (f) => !f.startsWith(".") // Ignore hidden files
-      );
-      const totalSizeBytes = walFiles.reduce((sum, file) => {
-        const filePath = join(walPath, file);
-        try {
-          return sum + statSync(filePath).size;
-        } catch {
-          return sum; // Skip files we can't read
-        }
-      }, 0);
+      // 1. Check WAL files
+      let walHealth: WALHealthResult;
+      if (existsSync(walPath)) {
+        const walFiles = readdirSync(walPath).filter(
+          (f) => !f.startsWith(".") // Ignore hidden files
+        );
+        const totalSizeBytes = walFiles.reduce((sum, file) => {
+          const filePath = join(walPath, file);
+          try {
+            return sum + statSync(filePath).size;
+          } catch {
+            return sum; // Skip files we can't read
+          }
+        }, 0);
 
-      const health = assessWALHealth({
-        fileCount: walFiles.length,
-        totalSizeBytes,
+        walHealth = assessWALHealth({
+          fileCount: walFiles.length,
+          totalSizeBytes,
+        });
+      } else {
+        walHealth = { healthy: true, warnings: [] };
+      }
+
+      // 2. Check for corrupted directories
+      const libraryDirs = existsSync(libraryPath)
+        ? readdirSync(libraryPath)
+        : [];
+      const corruptedDirs = checkCorruptedDirs(libraryPath, libraryDirs);
+
+      // 3. Check daemon status
+      const daemonConfig: DaemonConfig = {
+        socketPath: config.libraryPath,
+        pidPath: join(config.libraryPath, "daemon.pid"),
+        dbPath: join(config.libraryPath, "library"),
+      };
+      const daemonRunning = yield* Effect.promise(() =>
+        isDaemonRunning(daemonConfig)
+      );
+
+      // 4. Check Ollama connectivity
+      let ollamaReachable = false;
+      try {
+        yield* library.checkReady();
+        ollamaReachable = true;
+      } catch {
+        ollamaReachable = false;
+      }
+
+      // 5. Check for orphaned data
+      let orphanedData = { chunks: 0, embeddings: 0 };
+      try {
+        const repairResult = yield* library.repair();
+        orphanedData = {
+          chunks: repairResult.orphanedChunks,
+          embeddings: repairResult.orphanedEmbeddings,
+        };
+      } catch {
+        // If repair fails, assume no orphans (database might not exist)
+      }
+
+      // Assess overall health
+      const doctorHealth = assessDoctorHealth({
+        walHealth,
+        corruptedDirs,
+        daemonRunning,
+        ollamaReachable,
+        orphanedData,
       });
 
-      // Display stats
-      const sizeMB = (totalSizeBytes / (1024 * 1024)).toFixed(1);
-      yield* Console.log(`WAL Statistics:`);
-      yield* Console.log(`  Files:  ${walFiles.length}`);
-      yield* Console.log(`  Size:   ${sizeMB} MB`);
-      yield* Console.log(`  Path:   ${walPath}\n`);
-
-      if (health.healthy) {
-        yield* Console.log("✓ Database health is good");
-      } else {
-        yield* Console.log("⚠ Database health warnings:");
-        for (const warning of health.warnings) {
-          yield* Console.log(`  • ${warning}`);
+      // Display results
+      yield* Console.log("📊 Health Check Results:\n");
+      for (const check of doctorHealth.checks) {
+        const icon = check.healthy ? "✓" : "✗";
+        const status = check.healthy ? "healthy" : "ISSUE";
+        yield* Console.log(`${icon} ${check.name}: ${status}`);
+        if (check.details) {
+          yield* Console.log(`  ${check.details}`);
         }
-        yield* Console.log("\nRecommendations:");
-        yield* Console.log(
-          "  1. Run CHECKPOINT manually via your database connection"
-        );
-        yield* Console.log(
-          "  2. Consider export/import to compact the database:"
-        );
-        yield* Console.log("     pdf-brain export --output backup.tar.gz");
-        yield* Console.log("     pdf-brain import backup.tar.gz --force");
+      }
+
+      yield* Console.log("");
+
+      if (doctorHealth.healthy) {
+        yield* Console.log("✅ All checks passed! Database is healthy.");
+      } else {
+        yield* Console.log("⚠️  Issues detected.\n");
+
+        // Auto-fix if requested
+        if (shouldFix) {
+          yield* Console.log("🔧 Attempting auto-repair...\n");
+
+          // Fix corrupted directories
+          if (!corruptedDirs.healthy) {
+            for (const dir of corruptedDirs.issues) {
+              const dirPath = join(libraryPath, dir);
+              try {
+                rmSync(dirPath, { recursive: true, force: true });
+                yield* Console.log(`  ✓ Removed corrupted directory: ${dir}`);
+              } catch (error) {
+                yield* Console.log(`  ✗ Failed to remove ${dir}: ${error}`);
+              }
+            }
+          }
+
+          // Fix orphaned data (already done via repair() call)
+          if (orphanedData.chunks > 0 || orphanedData.embeddings > 0) {
+            yield* Console.log(
+              `  ✓ Cleaned ${orphanedData.chunks} orphaned chunks, ${orphanedData.embeddings} orphaned embeddings`
+            );
+          }
+
+          yield* Console.log(
+            "\n✅ Repair complete. Run 'pdf-brain doctor' again to verify."
+          );
+        } else {
+          // Show recommendations
+          yield* Console.log("💡 Recommendations:\n");
+
+          if (!walHealth.healthy) {
+            yield* Console.log(
+              "  WAL: Run CHECKPOINT or export/import to compact database"
+            );
+            yield* Console.log(
+              "       pdf-brain export --output backup.tar.gz"
+            );
+            yield* Console.log("       pdf-brain import backup.tar.gz --force");
+          }
+
+          if (!corruptedDirs.healthy) {
+            yield* Console.log(
+              `  Corrupted dirs: Run 'pdf-brain doctor --fix' to remove`
+            );
+          }
+
+          if (!daemonRunning) {
+            yield* Console.log("  Daemon: Start with 'pdf-brain daemon start'");
+          }
+
+          if (!ollamaReachable) {
+            yield* Console.log(
+              "  Ollama: Ensure Ollama is running (ollama serve)"
+            );
+          }
+
+          if (orphanedData.chunks > 0 || orphanedData.embeddings > 0) {
+            yield* Console.log(
+              "  Orphaned data: Already cleaned automatically"
+            );
+          }
+
+          yield* Console.log(
+            "\n  Run 'pdf-brain doctor --fix' to auto-repair issues."
+          );
+        }
       }
       break;
     }
@@ -748,6 +996,7 @@ const program = Effect.gen(function* () {
       const useTui = opts["no-tui"] !== true;
       const autoTag = opts["auto-tag"] === true;
       const enrich = opts.enrich === true;
+      const checkpointInterval = getCheckpointInterval(opts);
 
       // Discover files
       yield* Console.log(`Scanning ${targetDir}...`);
@@ -898,6 +1147,32 @@ const program = Effect.gen(function* () {
                 currentFile,
                 recentFiles: [...tui.getState().recentFiles, currentFile],
               });
+
+              // Checkpoint every N documents to prevent WAL accumulation
+              if (shouldCheckpoint(i + 1, checkpointInterval)) {
+                tui.update({
+                  checkpointInProgress: true,
+                  checkpointMessage: `Checkpointing WAL (${i + 1} docs)...`,
+                });
+
+                const checkpointResult = yield* Effect.either(
+                  library.checkpoint()
+                );
+
+                if (checkpointResult._tag === "Left") {
+                  yield* Effect.log(
+                    `Warning: Checkpoint failed at ${i + 1} docs: ${
+                      checkpointResult.left
+                    }`
+                  );
+                }
+
+                tui.update({
+                  checkpointInProgress: false,
+                  checkpointMessage: undefined,
+                  lastCheckpointAt: i + 1,
+                });
+              }
             } catch (error) {
               currentFile.status = "error";
               currentFile.error =
@@ -1008,6 +1283,21 @@ const program = Effect.gen(function* () {
             yield* Console.log(`  ✓ ${doc.title} (${doc.pageCount} pages)`);
             if (fileTags.length > 0) {
               yield* Console.log(`    Tags: ${doc.tags.join(", ")}`);
+            }
+
+            // Checkpoint every N documents to prevent WAL accumulation
+            if (shouldCheckpoint(processed, checkpointInterval)) {
+              yield* Console.log(
+                `  ⚡ Checkpointing WAL (${processed} docs)...`
+              );
+              const checkpointResult = yield* Effect.either(
+                library.checkpoint()
+              );
+              if (checkpointResult._tag === "Left") {
+                yield* Console.log(
+                  `  ⚠ Checkpoint warning: ${checkpointResult.left}`
+                );
+              }
             }
           } catch (error) {
             errors++;

@@ -10,7 +10,50 @@ import { tmpdir } from "node:os";
 import {
   MarkdownExtractor,
   MarkdownExtractorLive,
+  sanitizeText,
 } from "./MarkdownExtractor.js";
+
+// ============================================================================
+// sanitizeText() Tests
+// ============================================================================
+
+describe("sanitizeText", () => {
+  test("strips null bytes from markdown text", () => {
+    const input = "Hello\x00World\x00!";
+    const result = sanitizeText(input);
+    expect(result).toBe("HelloWorld!");
+  });
+
+  test("strips multiple consecutive null bytes", () => {
+    const input = "Text\x00\x00\x00with\x00\x00nulls";
+    const result = sanitizeText(input);
+    expect(result).toBe("Textwithnulls");
+  });
+
+  test("handles text with no null bytes", () => {
+    const input = "Clean markdown text";
+    const result = sanitizeText(input);
+    expect(result).toBe("Clean markdown text");
+  });
+
+  test("handles empty string", () => {
+    const input = "";
+    const result = sanitizeText(input);
+    expect(result).toBe("");
+  });
+
+  test("preserves unicode in markdown", () => {
+    const input = "café\x00naïve\x00résumé";
+    const result = sanitizeText(input);
+    expect(result).toBe("cafénaïverésumé");
+  });
+
+  test("preserves markdown syntax", () => {
+    const input = "# Heading\x00\n\n**bold**\x00";
+    const result = sanitizeText(input);
+    expect(result).toBe("# Heading\n\n**bold**");
+  });
+});
 
 // ============================================================================
 // Test Helpers
@@ -37,7 +80,7 @@ function runExtract(path: string) {
     Effect.gen(function* () {
       const extractor = yield* MarkdownExtractor;
       return yield* extractor.extract(path);
-    }).pipe(Effect.provide(MarkdownExtractorLive)),
+    }).pipe(Effect.provide(MarkdownExtractorLive))
   );
 }
 
@@ -46,7 +89,7 @@ function runProcess(path: string) {
     Effect.gen(function* () {
       const extractor = yield* MarkdownExtractor;
       return yield* extractor.process(path);
-    }).pipe(Effect.provide(MarkdownExtractorLive)),
+    }).pipe(Effect.provide(MarkdownExtractorLive))
   );
 }
 
@@ -55,7 +98,7 @@ function runExtractFrontmatter(path: string) {
     Effect.gen(function* () {
       const extractor = yield* MarkdownExtractor;
       return yield* extractor.extractFrontmatter(path);
-    }).pipe(Effect.provide(MarkdownExtractorLive)),
+    }).pipe(Effect.provide(MarkdownExtractorLive))
   );
 }
 
@@ -76,7 +119,7 @@ tags:
 ---
 
 # Content here
-`,
+`
     );
 
     const result = await runExtract(path);
@@ -93,7 +136,7 @@ title: Just a Title
 ---
 
 Some content.
-`,
+`
     );
 
     const result = await runExtract(path);
@@ -105,15 +148,15 @@ Some content.
   test("returns empty object for missing frontmatter", async () => {
     const path = writeTempFile(
       "no-frontmatter.md",
-      "# Just a heading\n\nSome content.",
+      "# Just a heading\n\nSome content."
     );
 
     const result = await runExtract(path);
     expect(result.frontmatter.title).toBeUndefined();
     expect(
       Object.keys(result.frontmatter).filter(
-        (k) => result.frontmatter[k] !== undefined,
-      ),
+        (k) => result.frontmatter[k] !== undefined
+      )
     ).toHaveLength(0);
   });
 
@@ -126,7 +169,7 @@ invalid: yaml: here
 ---
 
 Content after bad frontmatter.
-`,
+`
     );
 
     // Should not throw, returns empty or partial
@@ -146,7 +189,7 @@ custom_field: custom_value
 ---
 
 Content.
-`,
+`
     );
 
     const result = await runExtract(path);
@@ -164,7 +207,7 @@ title: Fast Path Test
 
 # Heading
 Content that we don't need to parse.
-`,
+`
     );
 
     const fm = await runExtractFrontmatter(path);
@@ -180,7 +223,7 @@ describe("Section Extraction", () => {
   test("extracts single H1 heading", async () => {
     const path = writeTempFile(
       "single-h1.md",
-      "# Main Title\n\nSome content here.",
+      "# Main Title\n\nSome content here."
     );
 
     const result = await runExtract(path);
@@ -204,7 +247,7 @@ Second section content.
 ### H3 Subsection
 
 Third section content.
-`,
+`
     );
 
     const result = await runExtract(path);
@@ -220,7 +263,7 @@ Third section content.
   test("handles document with no headings", async () => {
     const path = writeTempFile(
       "no-headings.md",
-      "Just plain text content.\n\nWith multiple paragraphs.\n\nNo headings at all.",
+      "Just plain text content.\n\nWith multiple paragraphs.\n\nNo headings at all."
     );
 
     const result = await runExtract(path);
@@ -237,7 +280,7 @@ Third section content.
 # First Heading
 
 Content after heading.
-`,
+`
     );
 
     const result = await runExtract(path);
@@ -253,14 +296,14 @@ Content after heading.
 # Second
 
 Content only in second.
-`,
+`
     );
 
     const result = await runExtract(path);
     expect(result.sections.length).toBeGreaterThanOrEqual(1);
     // At least one section should have the content
     const hasContent = result.sections.some((s) =>
-      s.text.includes("Content only"),
+      s.text.includes("Content only")
     );
     expect(hasContent).toBe(true);
   });
@@ -271,12 +314,12 @@ Content only in second.
       `# Hello & Goodbye: A "Test" <Document>
 
 Content here.
-`,
+`
     );
 
     const result = await runExtract(path);
     expect(result.sections[0].heading).toBe(
-      'Hello & Goodbye: A "Test" <Document>',
+      'Hello & Goodbye: A "Test" <Document>'
     );
   });
 
@@ -290,7 +333,7 @@ Content here.
 | Cell 1   | Cell 2   |
 
 ~~strikethrough~~ and **bold**.
-`,
+`
     );
 
     const result = await runExtract(path);
@@ -322,7 +365,7 @@ ${"First paragraph. ".repeat(50)}
 ${"Second paragraph. ".repeat(50)}
 
 ${"Third paragraph. ".repeat(50)}
-`,
+`
     );
 
     const result = await runProcess(path);
@@ -342,13 +385,13 @@ function hello() {
 \`\`\`
 
 Some text after.
-`,
+`
     );
 
     const result = await runProcess(path);
     // Code block content should be preserved (fences stripped by mdast-util-to-string)
     const codeChunk = result.chunks.find((c) =>
-      c.content.includes("console.log"),
+      c.content.includes("console.log")
     );
     expect(codeChunk).toBeDefined();
     expect(codeChunk?.content).toContain("function hello");
@@ -357,7 +400,7 @@ Some text after.
   test("preserves inline code content", async () => {
     const path = writeTempFile(
       "inline-code.md",
-      "# Inline\n\nUse `const x = 1` for variables.",
+      "# Inline\n\nUse `const x = 1` for variables."
     );
 
     const result = await runProcess(path);
@@ -374,7 +417,7 @@ Some text after.
 ${"Long content here. ".repeat(100)}
 
 x
-`,
+`
     );
 
     const result = await runProcess(path);
@@ -388,7 +431,7 @@ x
     const longSentence = "word ".repeat(200) + ".";
     const path = writeTempFile(
       "long-sentence.md",
-      `# Title\n\n${longSentence}`,
+      `# Title\n\n${longSentence}`
     );
 
     const result = await runProcess(path);
@@ -416,7 +459,7 @@ describe("Edge Cases", () => {
       `---
 title: Only Frontmatter
 ---
-`,
+`
     );
 
     const result = await runExtract(path);
@@ -438,7 +481,7 @@ title: Only Frontmatter
       `# Hello World
 
 Content with emojis and unicode: café, naïve, résumé.
-`,
+`
     );
 
     const result = await runExtract(path);
@@ -449,7 +492,7 @@ Content with emojis and unicode: café, naïve, résumé.
   test("handles Windows line endings (CRLF)", async () => {
     const path = writeTempFile(
       "crlf.md",
-      "# Title\r\n\r\nContent with CRLF.\r\n",
+      "# Title\r\n\r\nContent with CRLF.\r\n"
     );
 
     const result = await runExtract(path);
@@ -485,7 +528,7 @@ Content for section one.
 # Section Two
 
 Content for section two.
-`,
+`
     );
 
     const result = await runProcess(path);
@@ -501,12 +544,29 @@ Content for section two.
       `# Important Section
 
 This is the content.
-`,
+`
     );
 
     const result = await runProcess(path);
     // Chunk should include the heading for context
     const chunk = result.chunks[0];
     expect(chunk.content).toContain("Important Section");
+  });
+
+  test("process() strips null bytes from content", async () => {
+    const path = writeTempFile(
+      "null-bytes.md",
+      `# Title with\x00null bytes
+
+Content with\x00\x00multiple\x00null bytes.
+`
+    );
+
+    const result = await runProcess(path);
+    // Verify no null bytes in any chunk
+    for (const chunk of result.chunks) {
+      expect(chunk.content).not.toContain("\x00");
+      expect(chunk.content).toContain("null bytes");
+    }
   });
 });

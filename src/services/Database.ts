@@ -25,7 +25,7 @@ import {
   LibraryConfig,
 } from "../types.js";
 import { DatabaseClient } from "./DatabaseClient.js";
-import { isDaemonRunning } from "./Daemon.js";
+import { ensureDaemonRunning } from "./Daemon.js";
 
 // Embedding dimension for mxbai-embed-large
 const EMBEDDING_DIM = 1024;
@@ -119,15 +119,17 @@ export class Database extends Context.Tag("Database")<
 // ============================================================================
 
 /**
- * Main Database Layer - routes to daemon client or direct PGlite
+ * Main Database Layer - DAEMON-FIRST with auto-start and graceful fallback
  *
  * Strategy:
- * 1. Check if daemon is running (socket exists + responds)
- * 2. If yes: build Database from DatabaseClient (Unix socket connection)
- * 3. If no: use DirectDatabaseLive (direct PGlite, current behavior)
+ * 1. Try to ensure daemon is running (auto-start if not)
+ * 2. If daemon available: build Database from DatabaseClient (Unix socket connection)
+ * 3. If daemon failed to start: use DirectDatabaseLive (direct PGlite fallback)
  *
- * This provides multi-process safety via daemon while maintaining
- * single-process simplicity when daemon isn't running.
+ * This provides:
+ * - Multi-process safety via daemon (default)
+ * - Graceful degradation to single-process mode if daemon fails
+ * - No manual daemon management required
  */
 export const DatabaseLive = Layer.unwrapEffect(
   Effect.gen(function* () {
@@ -140,11 +142,13 @@ export const DatabaseLive = Layer.unwrapEffect(
       dbPath: config.dbPath,
     };
 
-    // Check if daemon is running
-    const running = yield* Effect.promise(() => isDaemonRunning(daemonConfig));
+    // Ensure daemon is running - auto-start if needed
+    const daemonStatus = yield* Effect.promise(() =>
+      ensureDaemonRunning(daemonConfig)
+    );
 
-    if (running) {
-      // Route to DatabaseClient (Unix socket connection)
+    if (daemonStatus.success) {
+      // Daemon is available - route to DatabaseClient (Unix socket connection)
       // Build layer that provides Database service using DatabaseClient implementation
       return Layer.effect(
         Database,
@@ -156,7 +160,18 @@ export const DatabaseLive = Layer.unwrapEffect(
         )
       );
     } else {
-      // Route to direct PGlite implementation
+      // Daemon failed to start - fall back to direct PGlite
+      // Log warning so user knows they're not getting multi-process safety
+      console.warn(
+        `⚠️  Daemon failed to start (${daemonStatus.error}). Using direct PGlite mode.`
+      );
+      console.warn(
+        "   Multi-process safety disabled. If multiple CLI commands run simultaneously,"
+      );
+      console.warn(
+        "   database corruption may occur. Use single process only."
+      );
+
       return DirectDatabaseLive;
     }
   })

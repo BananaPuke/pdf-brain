@@ -229,8 +229,8 @@ export class PDFLibrary extends Effect.Service<PDFLibrary>()("PDFLibrary", {
           }));
           yield* db.addEmbeddings(embeddingRecords);
 
-          // Force checkpoint to prevent WAL accumulation
-          yield* db.checkpoint();
+          // Note: Checkpoint is now handled by batch operations (e.g., ingest command)
+          // to avoid unnecessary WAL flushes on every single document add
 
           return doc;
         }),
@@ -460,6 +460,12 @@ export class PDFLibrary extends Effect.Service<PDFLibrary>()("PDFLibrary", {
        * Removes orphaned chunks and embeddings
        */
       repair: () => db.repair(),
+
+      /**
+       * Force database checkpoint to flush WAL to data files
+       * Call this after batch operations to prevent WAL accumulation
+       */
+      checkpoint: () => db.checkpoint(),
     };
   }),
   dependencies: [
