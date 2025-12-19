@@ -4,21 +4,21 @@
  * Built with Effect for robust error handling and composability.
  */
 
-import { Effect } from "effect";
+import { Duration, Effect, Layer } from "effect";
 import { createHash } from "node:crypto";
 import { statSync } from "node:fs";
 import { basename } from "node:path";
 
 import {
-  Document,
-  PDFDocument,
-  SearchResult,
-  SearchOptions,
   AddOptions,
-  LibraryConfig,
+  Document,
   DocumentExistsError,
   DocumentNotFoundError,
+  LibraryConfig,
+  SearchOptions,
+  SearchResult,
 } from "./types.js";
+import { DEFAULT_QUEUE_CONFIG } from "./services/EmbeddingQueue.js";
 
 import { Ollama, OllamaLive } from "./services/Ollama.js";
 import { PDFExtractor, PDFExtractorLive } from "./services/PDFExtractor.js";
@@ -26,7 +26,8 @@ import {
   MarkdownExtractor,
   MarkdownExtractorLive,
 } from "./services/MarkdownExtractor.js";
-import { Database, DatabaseLive } from "./services/Database.js";
+import { Database } from "./services/Database.js";
+import { LibSQLDatabase } from "./services/LibSQLDatabase.js";
 
 // Re-export types and services
 export * from "./types.js";
@@ -36,7 +37,8 @@ export {
   MarkdownExtractor,
   MarkdownExtractorLive,
 } from "./services/MarkdownExtractor.js";
-export { Database, DatabaseLive } from "./services/Database.js";
+export { Database } from "./services/Database.js";
+export { LibSQLDatabase } from "./services/LibSQLDatabase.js";
 
 // ============================================================================
 // Helper Functions
@@ -215,22 +217,54 @@ export class PDFLibrary extends Effect.Service<PDFLibrary>()("PDFLibrary", {
           }));
           yield* db.addChunks(chunkRecords);
 
-          // Generate embeddings with progress
+          // Generate embeddings with gated batching to prevent WASM OOM
+          // This processes in batches of 50, checkpointing after each batch
+          // to keep WAL size bounded and prevent daemon crashes
+          const batchSize = DEFAULT_QUEUE_CONFIG.batchSize;
           yield* Effect.log(
-            `Generating embeddings for ${chunks.length} chunks...`
+            `Generating embeddings for ${chunks.length} chunks (batch size: ${batchSize})...`
           );
+
           const contents = chunks.map((c) => c.content);
-          const embeddings = yield* ollama.embedBatch(contents, 5);
 
-          // Store embeddings
-          const embeddingRecords = embeddings.map((emb, i) => ({
-            chunkId: `${id}-${i}`,
-            embedding: emb,
-          }));
-          yield* db.addEmbeddings(embeddingRecords);
+          // Process embeddings in gated batches
+          // Each batch: generate embeddings → write to DB → checkpoint
+          let batchStart = 0;
 
-          // Note: Checkpoint is now handled by batch operations (e.g., ingest command)
-          // to avoid unnecessary WAL flushes on every single document add
+          while (batchStart < contents.length) {
+            const batchEnd = Math.min(batchStart + batchSize, contents.length);
+            const batchContents = contents.slice(batchStart, batchEnd);
+
+            // Generate embeddings for this batch with bounded concurrency
+            const batchEmbeddings = yield* ollama.embedBatch(
+              batchContents,
+              DEFAULT_QUEUE_CONFIG.concurrency
+            );
+
+            // Store this batch's embeddings
+            const embeddingRecords = batchEmbeddings.map((emb, i) => ({
+              chunkId: `${id}-${batchStart + i}`,
+              embedding: emb,
+            }));
+            yield* db.addEmbeddings(embeddingRecords);
+
+            // CRITICAL: Checkpoint after each batch to flush WAL
+            // This prevents WASM OOM from unbounded WAL growth
+            yield* db.checkpoint();
+
+            yield* Effect.log(
+              `  Processed ${batchEnd}/${contents.length} embeddings`
+            );
+
+            batchStart = batchEnd;
+
+            // Backpressure: small delay between batches to let GC run
+            if (batchStart < contents.length) {
+              yield* Effect.sleep(
+                Duration.millis(DEFAULT_QUEUE_CONFIG.batchDelayMs)
+              );
+            }
+          }
 
           return doc;
         }),
@@ -468,12 +502,7 @@ export class PDFLibrary extends Effect.Service<PDFLibrary>()("PDFLibrary", {
       checkpoint: () => db.checkpoint(),
     };
   }),
-  dependencies: [
-    OllamaLive,
-    PDFExtractorLive,
-    MarkdownExtractorLive,
-    DatabaseLive,
-  ],
+  dependencies: [OllamaLive, PDFExtractorLive, MarkdownExtractorLive],
 }) {}
 
 // ============================================================================
@@ -481,6 +510,11 @@ export class PDFLibrary extends Effect.Service<PDFLibrary>()("PDFLibrary", {
 // ============================================================================
 
 /**
- * Full application layer with all services
+ * Full application layer with all services using LibSQL database
  */
-export const PDFLibraryLive = PDFLibrary.Default;
+export const PDFLibraryLive = (() => {
+  const config = LibraryConfig.fromEnv();
+  const dbLayer = LibSQLDatabase.make({ url: `file:${config.dbPath}` });
+
+  return PDFLibrary.Default.pipe(Layer.provide(dbLayer));
+})();

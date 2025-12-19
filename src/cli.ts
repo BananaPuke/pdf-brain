@@ -15,12 +15,6 @@ import {
 import { basename, extname, join, dirname } from "path";
 import { fileURLToPath } from "url";
 import {
-  startDaemon,
-  stopDaemon,
-  isDaemonRunning,
-  DaemonConfig,
-} from "./services/Daemon.js";
-import {
   renderIngestProgress,
   createInitialState,
   type FileStatus,
@@ -191,7 +185,6 @@ export interface HealthCheck {
 export function assessDoctorHealth(data: {
   walHealth: WALHealthResult;
   corruptedDirs: CorruptedDirsResult;
-  daemonRunning: boolean;
   ollamaReachable: boolean;
   orphanedData: { chunks: number; embeddings: number };
 }): DoctorHealthResult {
@@ -215,13 +208,6 @@ export function assessDoctorHealth(data: {
       data.corruptedDirs.issues.length > 0
         ? `Found: ${data.corruptedDirs.issues.join(", ")}`
         : undefined,
-  });
-
-  // Daemon check
-  checks.push({
-    name: "Daemon",
-    healthy: data.daemonRunning,
-    details: data.daemonRunning ? undefined : "Not running",
   });
 
   // Ollama check
@@ -335,7 +321,7 @@ const HELP = `
     ██████╗      ┃   Local knowledge base with vector search      ┃
     ██╔══██╗     ┃   ─────────────────────────────────────────    ┃
     ██████╔╝     ┃   PDFs & Markdown → Chunks → Embeddings        ┃
-    ██╔═══╝      ┃   Powered by PGlite + pgvector + Ollama        ┃
+    ██╔═══╝      ┃   Powered by LibSQL + Ollama                   ┃
     ██║          ┃                                                ┃
     ╚═╝  BRAIN   ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
 
@@ -368,15 +354,11 @@ Commands:
 
   check                   Verify Ollama is running and model available
 
-  doctor                  Comprehensive health check (WAL, corrupted dirs, daemon, Ollama, orphaned data)
+  doctor                  Comprehensive health check (WAL, corrupted dirs, Ollama, orphaned data)
     --fix                 Auto-repair detected issues
 
   repair                  Fix database integrity issues
                            Removes orphaned chunks/embeddings
-
-  daemon start            Start background daemon process
-  daemon stop             Stop daemon gracefully
-  daemon status           Show daemon running status
 
   ingest <directory>      Batch ingest PDFs/Markdown from directory
     --recursive           Include subdirectories (default: true)
@@ -697,17 +679,7 @@ const program = Effect.gen(function* () {
         : [];
       const corruptedDirs = checkCorruptedDirs(libraryPath, libraryDirs);
 
-      // 3. Check daemon status
-      const daemonConfig: DaemonConfig = {
-        socketPath: config.libraryPath,
-        pidPath: join(config.libraryPath, "daemon.pid"),
-        dbPath: join(config.libraryPath, "library"),
-      };
-      const daemonRunning = yield* Effect.promise(() =>
-        isDaemonRunning(daemonConfig)
-      );
-
-      // 4. Check Ollama connectivity
+      // 3. Check Ollama connectivity
       let ollamaReachable = false;
       try {
         yield* library.checkReady();
@@ -716,7 +688,7 @@ const program = Effect.gen(function* () {
         ollamaReachable = false;
       }
 
-      // 5. Check for orphaned data
+      // 4. Check for orphaned data
       let orphanedData = { chunks: 0, embeddings: 0 };
       try {
         const repairResult = yield* library.repair();
@@ -732,7 +704,6 @@ const program = Effect.gen(function* () {
       const doctorHealth = assessDoctorHealth({
         walHealth,
         corruptedDirs,
-        daemonRunning,
         ollamaReachable,
         orphanedData,
       });
@@ -800,10 +771,6 @@ const program = Effect.gen(function* () {
             yield* Console.log(
               `  Corrupted dirs: Run 'pdf-brain doctor --fix' to remove`
             );
-          }
-
-          if (!daemonRunning) {
-            yield* Console.log("  Daemon: Start with 'pdf-brain daemon start'");
           }
 
           if (!ollamaReachable) {
@@ -1334,35 +1301,7 @@ async function gracefulShutdown(signal: string) {
   isShuttingDown = true;
 
   console.error(`\n${signal} received, shutting down gracefully...`);
-
-  try {
-    // Import here to avoid circular dependencies
-    const { Database, DatabaseLive } = await import("./services/Database.js");
-    const { LibraryConfig } = await import("./types.js");
-
-    const config = LibraryConfig.fromEnv();
-    const dbDir = config.dbPath.replace(".db", "");
-
-    // Only run checkpoint if database exists
-    const { existsSync } = await import("fs");
-    if (existsSync(dbDir)) {
-      console.error("Running CHECKPOINT...");
-
-      const checkpointEffect = Effect.gen(function* () {
-        const db = yield* Database;
-        yield* db.checkpoint();
-      });
-
-      await Effect.runPromise(
-        checkpointEffect.pipe(Effect.provide(DatabaseLive), Effect.scoped)
-      );
-      console.error("✓ CHECKPOINT complete");
-    }
-  } catch (error) {
-    console.error(`Warning: Shutdown checkpoint failed: ${error}`);
-    // Don't block exit on checkpoint failure
-  }
-
+  // libSQL auto-syncs on close, no explicit checkpoint needed
   process.exit(0);
 }
 
@@ -1370,159 +1309,10 @@ async function gracefulShutdown(signal: string) {
 process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
 
-// Handle daemon and migrate commands separately (don't need full PDFLibrary)
+// Handle migrate command separately (don't need full PDFLibrary)
 const args = process.argv.slice(2);
 
-if (args[0] === "daemon") {
-  const subcommand = args[1];
-  const config = LibraryConfig.fromEnv();
-  const daemonConfig: DaemonConfig = {
-    socketPath: config.libraryPath, // Directory for socket file
-    pidPath: join(config.libraryPath, "daemon.pid"),
-    dbPath: config.dbPath,
-  };
-
-  const daemonProgram = Effect.gen(function* () {
-    switch (subcommand) {
-      case "start": {
-        // Check if already running
-        const running = yield* Effect.promise(() =>
-          isDaemonRunning(daemonConfig)
-        );
-
-        if (running) {
-          yield* Console.log("✓ Daemon is already running");
-          break;
-        }
-
-        // Check for --foreground flag
-        const opts = parseArgs(args.slice(2));
-        if (opts.foreground) {
-          // Run daemon in foreground (called by detached spawn)
-          yield* Console.log("Starting daemon in foreground...");
-          yield* Console.log(
-            `  Socket: ${daemonConfig.socketPath}/.s.PGSQL.5432`
-          );
-          yield* Console.log(`  PID: ${process.pid}`);
-          yield* Effect.promise(() => startDaemon(daemonConfig));
-
-          // Keep process alive - daemon handles shutdown via signals
-          yield* Effect.promise(() => new Promise(() => {}));
-        } else {
-          // Spawn background process
-          yield* Console.log("Starting daemon...");
-
-          const proc = Bun.spawn(
-            [
-              "bun",
-              "run",
-              join(__dirname, "cli.ts"),
-              "daemon",
-              "start",
-              "--foreground",
-            ],
-            {
-              cwd: process.cwd(),
-              stdio: ["ignore", "ignore", "ignore"],
-              detached: true,
-            }
-          );
-          proc.unref();
-
-          // Wait for socket to be available (max 5 seconds)
-          const startTime = Date.now();
-          const timeout = 5000;
-          while (Date.now() - startTime < timeout) {
-            const running = yield* Effect.promise(() =>
-              isDaemonRunning(daemonConfig)
-            );
-            if (running) {
-              yield* Console.log("✓ Daemon started successfully");
-              yield* Console.log(
-                `  Socket: ${daemonConfig.socketPath}/.s.PGSQL.5432`
-              );
-              break;
-            }
-            // Wait 100ms before checking again
-            yield* Effect.sleep("100 millis");
-          }
-
-          const finalCheck = yield* Effect.promise(() =>
-            isDaemonRunning(daemonConfig)
-          );
-          if (!finalCheck) {
-            yield* Console.error("⚠ Daemon may have failed to start");
-            yield* Console.error("  Check logs for details");
-            process.exit(1);
-          }
-        }
-        break;
-      }
-
-      case "stop": {
-        const running = yield* Effect.promise(() =>
-          isDaemonRunning(daemonConfig)
-        );
-
-        if (!running) {
-          yield* Console.log("Daemon is not running");
-          break;
-        }
-
-        yield* Console.log("Stopping daemon...");
-        yield* Effect.promise(() => stopDaemon(daemonConfig));
-        yield* Console.log("✓ Daemon stopped");
-        break;
-      }
-
-      case "status": {
-        const running = yield* Effect.promise(() =>
-          isDaemonRunning(daemonConfig)
-        );
-
-        if (running) {
-          yield* Console.log("✓ Daemon is running");
-          yield* Console.log(
-            `  Socket: ${daemonConfig.socketPath}/.s.PGSQL.5432`
-          );
-          yield* Console.log(`  PID file: ${daemonConfig.pidPath}`);
-        } else {
-          yield* Console.log("Daemon is not running");
-        }
-        break;
-      }
-
-      default: {
-        yield* Console.error(
-          `Unknown daemon subcommand: ${subcommand || "(none)"}`
-        );
-        yield* Console.log(`
-Usage: pdf-brain daemon <subcommand>
-
-Subcommands:
-  start    Start the daemon in background
-  stop     Stop the daemon gracefully
-  status   Show daemon status
-
-The daemon solves PGlite's single-connection limitation by running
-a background process that owns the database and exposes it via Unix socket.
-        `);
-        process.exit(1);
-      }
-    }
-  });
-
-  Effect.runPromise(
-    daemonProgram.pipe(
-      Effect.catchAll((error) =>
-        Effect.gen(function* () {
-          yield* Console.error(`Daemon Error: ${JSON.stringify(error)}`);
-          process.exit(1);
-        })
-      )
-    )
-  );
-} else if (args[0] === "migrate") {
+if (args[0] === "migrate") {
   const migrateProgram = Effect.gen(function* () {
     const opts = parseArgs(args.slice(1));
     const migration = yield* Migration;

@@ -1,0 +1,577 @@
+/**
+ * LibSQL Database Service
+ *
+ * Implements the Database interface using @libsql/client.
+ * Designed for file-based and remote libSQL/Turso databases.
+ */
+
+import { Effect, Layer } from "effect";
+import { createClient, type Client } from "@libsql/client";
+import { Database } from "./Database.js";
+import { DatabaseError, Document } from "../types.js";
+
+// Embedding dimension for mxbai-embed-large
+const EMBEDDING_DIM = 1024;
+
+// ============================================================================
+// LibSQLDatabase Service
+// ============================================================================
+
+export class LibSQLDatabase {
+  /**
+   * Create a LibSQL Database layer
+   *
+   * @param config - Connection configuration
+   *   - url: ":memory:" for in-memory, "file:./path.db" for local file, or remote URL
+   *   - authToken: Optional auth token for Turso/remote databases
+   */
+  static make(config: { url: string; authToken?: string }) {
+    return Layer.scoped(
+      Database,
+      Effect.gen(function* () {
+        // Create libSQL client
+        const client = createClient({
+          url: config.url,
+          authToken: config.authToken,
+        });
+
+        // Initialize schema
+        yield* Effect.tryPromise({
+          try: async () => {
+            await initSchema(client);
+          },
+          catch: (e) =>
+            new DatabaseError({ reason: `Schema init failed: ${e}` }),
+        });
+
+        // Cleanup on scope close
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            client.close();
+          })
+        );
+
+        // Helper to parse document row
+        const parseDocRow = (row: any): Document =>
+          new Document({
+            id: row.id as string,
+            title: row.title as string,
+            path: row.path as string,
+            addedAt: new Date(row.added_at as string),
+            pageCount: row.page_count as number,
+            sizeBytes: row.size_bytes as number,
+            tags: JSON.parse(row.tags as string) as string[],
+            metadata: JSON.parse(row.metadata as string) as Record<
+              string,
+              unknown
+            >,
+          });
+
+        // Return Database implementation
+        return {
+          addDocument: (doc) =>
+            Effect.tryPromise({
+              try: async () => {
+                await client.execute({
+                  sql: `INSERT INTO documents (id, title, path, added_at, page_count, size_bytes, tags, metadata)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT (id) DO UPDATE SET
+                          title = excluded.title,
+                          path = excluded.path,
+                          added_at = excluded.added_at,
+                          page_count = excluded.page_count,
+                          size_bytes = excluded.size_bytes,
+                          tags = excluded.tags,
+                          metadata = excluded.metadata`,
+                  args: [
+                    doc.id,
+                    doc.title,
+                    doc.path,
+                    doc.addedAt.toISOString(),
+                    doc.pageCount,
+                    doc.sizeBytes,
+                    JSON.stringify(doc.tags),
+                    JSON.stringify(doc.metadata || {}),
+                  ],
+                });
+              },
+              catch: (e) => new DatabaseError({ reason: String(e) }),
+            }),
+
+          getDocument: (id) =>
+            Effect.tryPromise({
+              try: async () => {
+                const result = await client.execute({
+                  sql: "SELECT * FROM documents WHERE id = ?",
+                  args: [id],
+                });
+                return result.rows.length > 0
+                  ? parseDocRow(result.rows[0])
+                  : null;
+              },
+              catch: (e) => new DatabaseError({ reason: String(e) }),
+            }),
+
+          getDocumentByPath: (path) =>
+            Effect.tryPromise({
+              try: async () => {
+                const result = await client.execute({
+                  sql: "SELECT * FROM documents WHERE path = ?",
+                  args: [path],
+                });
+                return result.rows.length > 0
+                  ? parseDocRow(result.rows[0])
+                  : null;
+              },
+              catch: (e) => new DatabaseError({ reason: String(e) }),
+            }),
+
+          listDocuments: (tag) =>
+            Effect.tryPromise({
+              try: async () => {
+                let sql = "SELECT * FROM documents";
+                const args: any[] = [];
+
+                if (tag) {
+                  sql +=
+                    " WHERE json_array_length(tags) > 0 AND EXISTS (SELECT 1 FROM json_each(tags) WHERE value = ?)";
+                  args.push(tag);
+                }
+
+                sql += " ORDER BY added_at DESC";
+
+                const result = await client.execute({ sql, args });
+                return result.rows.map(parseDocRow);
+              },
+              catch: (e) => new DatabaseError({ reason: String(e) }),
+            }),
+
+          deleteDocument: (id) =>
+            Effect.tryPromise({
+              try: async () => {
+                await client.execute({
+                  sql: "DELETE FROM documents WHERE id = ?",
+                  args: [id],
+                });
+              },
+              catch: (e) => new DatabaseError({ reason: String(e) }),
+            }),
+          updateTags: (id, tags) =>
+            Effect.tryPromise({
+              try: async () => {
+                await client.execute({
+                  sql: "UPDATE documents SET tags = ? WHERE id = ?",
+                  args: [JSON.stringify(tags), id],
+                });
+              },
+              catch: (e) => new DatabaseError({ reason: String(e) }),
+            }),
+
+          addChunks: (chunks) =>
+            Effect.tryPromise({
+              try: async () => {
+                // Use batch for transaction
+                const statements = chunks.map((chunk) => ({
+                  sql: "INSERT INTO chunks (id, doc_id, page, chunk_index, content) VALUES (?, ?, ?, ?, ?)",
+                  args: [
+                    chunk.id,
+                    chunk.docId,
+                    chunk.page,
+                    chunk.chunkIndex,
+                    chunk.content,
+                  ],
+                }));
+                await client.batch(statements, "write");
+              },
+              catch: (e) => new DatabaseError({ reason: String(e) }),
+            }),
+
+          addEmbeddings: (embeddings) =>
+            Effect.tryPromise({
+              try: async () => {
+                // LibSQL stores vectors as F32_BLOB
+                // Must serialize as JSON string of float array
+                const statements = embeddings.map((item) => ({
+                  sql: "INSERT INTO embeddings (chunk_id, embedding) VALUES (?, ?)",
+                  args: [item.chunkId, JSON.stringify(item.embedding)],
+                }));
+                await client.batch(statements, "write");
+              },
+              catch: (e) => new DatabaseError({ reason: String(e) }),
+            }),
+
+          vectorSearch: (queryEmbedding, options) =>
+            Effect.tryPromise({
+              try: async () => {
+                const { limit = 10, threshold = 0.3, tags } = options || {};
+
+                // LibSQL vector search uses vector_distance_cos()
+                // Returns 0-2, where 0 is identical
+                // Similarity = 1 - (distance / 2) to get 0-1 range
+                let sql = `
+                  SELECT 
+                    c.doc_id,
+                    d.title,
+                    c.page,
+                    c.chunk_index,
+                    c.content,
+                    (1 - vector_distance_cos(e.embedding, ?) / 2) as score
+                  FROM embeddings e
+                  JOIN chunks c ON c.id = e.chunk_id
+                  JOIN documents d ON d.id = c.doc_id
+                `;
+
+                const args: any[] = [JSON.stringify(queryEmbedding)];
+
+                const conditions: string[] = [];
+
+                if (tags && tags.length > 0) {
+                  // Check each tag
+                  conditions.push(
+                    tags
+                      .map(
+                        () =>
+                          "EXISTS (SELECT 1 FROM json_each(d.tags) WHERE value = ?)"
+                      )
+                      .join(" OR ")
+                  );
+                  args.push(...tags);
+                }
+
+                // Filter by threshold
+                conditions.push(
+                  "(1 - vector_distance_cos(e.embedding, ?) / 2) >= ?"
+                );
+                args.push(JSON.stringify(queryEmbedding), threshold);
+
+                if (conditions.length > 0) {
+                  sql += " WHERE " + conditions.join(" AND ");
+                }
+
+                sql += ` ORDER BY vector_distance_cos(e.embedding, ?) ASC LIMIT ${limit}`;
+                args.push(JSON.stringify(queryEmbedding));
+
+                const result = await client.execute({ sql, args });
+
+                return result.rows.map(
+                  (row: any) =>
+                    ({
+                      docId: row.doc_id,
+                      title: row.title,
+                      page: Number(row.page),
+                      chunkIndex: Number(row.chunk_index),
+                      content: row.content,
+                      score: Number(row.score),
+                      matchType: "vector",
+                    } as any)
+                );
+              },
+              catch: (e) => new DatabaseError({ reason: String(e) }),
+            }),
+
+          ftsSearch: (query, options) =>
+            Effect.tryPromise({
+              try: async () => {
+                const { limit = 10, tags } = options || {};
+
+                // LibSQL FTS5 uses MATCH syntax
+                // FTS5 rank() returns NEGATIVE scores - more negative = better match
+                let sql = `
+                  SELECT 
+                    c.doc_id,
+                    d.title,
+                    c.page,
+                    c.chunk_index,
+                    c.content,
+                    fts.rank as score
+                  FROM chunks_fts fts
+                  JOIN chunks c ON c.rowid = fts.rowid
+                  JOIN documents d ON d.id = c.doc_id
+                  WHERE fts.content MATCH ?
+                `;
+
+                const args: any[] = [query];
+
+                if (tags && tags.length > 0) {
+                  // Filter by tags using json_each
+                  sql +=
+                    " AND EXISTS (SELECT 1 FROM json_each(d.tags) WHERE value IN (" +
+                    tags.map(() => "?").join(", ") +
+                    "))";
+                  args.push(...tags);
+                }
+
+                // Order by rank DESC (most negative = best match)
+                // Note: FTS5 rank is negative, so we use DESC to get best matches first
+                sql += ` ORDER BY fts.rank DESC LIMIT ?`;
+                args.push(limit);
+
+                const result = await client.execute({ sql, args });
+
+                return result.rows.map(
+                  (row: any) =>
+                    ({
+                      docId: row.doc_id,
+                      title: row.title,
+                      page: Number(row.page),
+                      chunkIndex: Number(row.chunk_index),
+                      content: row.content,
+                      // Negate score to make it positive for consistency
+                      score: Math.abs(Number(row.score)),
+                      matchType: "fts",
+                    } as any)
+                );
+              },
+              catch: (e) => new DatabaseError({ reason: String(e) }),
+            }),
+
+          getExpandedContext: (docId, chunkIndex, options) =>
+            Effect.tryPromise({
+              try: async () => {
+                const { maxChars = 2000, direction = "both" } = options || {};
+
+                // Get target chunk
+                const targetResult = await client.execute({
+                  sql: "SELECT chunk_index, content FROM chunks WHERE doc_id = ? AND chunk_index = ?",
+                  args: [docId, chunkIndex],
+                });
+
+                if (targetResult.rows.length === 0) {
+                  return {
+                    content: "",
+                    startIndex: chunkIndex,
+                    endIndex: chunkIndex,
+                  };
+                }
+
+                let totalContent = (targetResult.rows[0] as any).content;
+                let startIdx = chunkIndex;
+                let endIdx = chunkIndex;
+
+                // Expand before
+                if (direction === "before" || direction === "both") {
+                  let beforeIdx = chunkIndex - 1;
+                  while (totalContent.length < maxChars && beforeIdx >= 0) {
+                    const beforeResult = await client.execute({
+                      sql: "SELECT content FROM chunks WHERE doc_id = ? AND chunk_index = ?",
+                      args: [docId, beforeIdx],
+                    });
+                    if (beforeResult.rows.length === 0) break;
+
+                    const beforeContent = (beforeResult.rows[0] as any).content;
+                    if (
+                      totalContent.length + beforeContent.length >
+                      maxChars * 1.2
+                    )
+                      break;
+
+                    totalContent = beforeContent + "\n" + totalContent;
+                    startIdx = beforeIdx;
+                    beforeIdx--;
+                  }
+                }
+
+                // Expand after
+                if (direction === "after" || direction === "both") {
+                  let afterIdx = chunkIndex + 1;
+                  while (totalContent.length < maxChars) {
+                    const afterResult = await client.execute({
+                      sql: "SELECT content FROM chunks WHERE doc_id = ? AND chunk_index = ?",
+                      args: [docId, afterIdx],
+                    });
+                    if (afterResult.rows.length === 0) break;
+
+                    const afterContent = (afterResult.rows[0] as any).content;
+                    if (
+                      totalContent.length + afterContent.length >
+                      maxChars * 1.2
+                    )
+                      break;
+
+                    totalContent = totalContent + "\n" + afterContent;
+                    endIdx = afterIdx;
+                    afterIdx++;
+                  }
+                }
+
+                return {
+                  content: totalContent,
+                  startIndex: startIdx,
+                  endIndex: endIdx,
+                };
+              },
+              catch: (e) => new DatabaseError({ reason: String(e) }),
+            }),
+
+          getStats: () =>
+            Effect.tryPromise({
+              try: async () => {
+                const docs = await client.execute(
+                  "SELECT COUNT(*) as count FROM documents"
+                );
+                const chunks = await client.execute(
+                  "SELECT COUNT(*) as count FROM chunks"
+                );
+                const embeddings = await client.execute(
+                  "SELECT COUNT(*) as count FROM embeddings"
+                );
+
+                return {
+                  documents: Number((docs.rows[0] as any).count),
+                  chunks: Number((chunks.rows[0] as any).count),
+                  embeddings: Number((embeddings.rows[0] as any).count),
+                };
+              },
+              catch: (e) => new DatabaseError({ reason: String(e) }),
+            }),
+
+          repair: () =>
+            Effect.tryPromise({
+              try: async () => {
+                // Count orphaned chunks
+                const orphanedChunksResult = await client.execute(`
+                  SELECT COUNT(*) as count FROM chunks c
+                  WHERE NOT EXISTS (SELECT 1 FROM documents d WHERE d.id = c.doc_id)
+                `);
+                const orphanedChunks = Number(
+                  (orphanedChunksResult.rows[0] as any).count
+                );
+
+                // Count orphaned embeddings
+                const orphanedEmbeddingsResult = await client.execute(`
+                  SELECT COUNT(*) as count FROM embeddings e
+                  WHERE NOT EXISTS (SELECT 1 FROM chunks c WHERE c.id = e.chunk_id)
+                `);
+                const orphanedEmbeddings = Number(
+                  (orphanedEmbeddingsResult.rows[0] as any).count
+                );
+
+                // Delete orphaned embeddings first
+                if (orphanedEmbeddings > 0) {
+                  await client.execute(`
+                    DELETE FROM embeddings e
+                    WHERE NOT EXISTS (SELECT 1 FROM chunks c WHERE c.id = e.chunk_id)
+                  `);
+                }
+
+                // Delete orphaned chunks
+                if (orphanedChunks > 0) {
+                  await client.execute(`
+                    DELETE FROM chunks c
+                    WHERE NOT EXISTS (SELECT 1 FROM documents d WHERE d.id = c.doc_id)
+                  `);
+                }
+
+                return {
+                  orphanedChunks,
+                  orphanedEmbeddings,
+                  zeroVectorEmbeddings: 0, // LibSQL doesn't expose vector validation
+                };
+              },
+              catch: (e) => new DatabaseError({ reason: String(e) }),
+            }),
+
+          checkpoint: () =>
+            Effect.tryPromise({
+              try: async () => {
+                // LibSQL syncs automatically, but we can force a sync
+                await client.sync();
+              },
+              catch: (e) =>
+                new DatabaseError({ reason: `Checkpoint failed: ${e}` }),
+            }),
+
+          dumpDataDir: () =>
+            Effect.fail(
+              new DatabaseError({
+                reason: "dumpDataDir not supported for LibSQL",
+              })
+            ),
+        };
+      })
+    );
+  }
+}
+
+// ============================================================================
+// Schema Initialization
+// ============================================================================
+
+async function initSchema(client: Client): Promise<void> {
+  // Documents table
+  await client.execute(`
+    CREATE TABLE IF NOT EXISTS documents (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      path TEXT NOT NULL UNIQUE,
+      added_at TEXT NOT NULL,
+      page_count INTEGER NOT NULL,
+      size_bytes INTEGER NOT NULL,
+      tags TEXT DEFAULT '[]',
+      metadata TEXT DEFAULT '{}'
+    )
+  `);
+
+  // Chunks table
+  await client.execute(`
+    CREATE TABLE IF NOT EXISTS chunks (
+      id TEXT PRIMARY KEY,
+      doc_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+      page INTEGER NOT NULL,
+      chunk_index INTEGER NOT NULL,
+      content TEXT NOT NULL
+    )
+  `);
+
+  // Embeddings table with F32_BLOB for vectors
+  await client.execute(`
+    CREATE TABLE IF NOT EXISTS embeddings (
+      chunk_id TEXT PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,
+      embedding F32_BLOB(${EMBEDDING_DIM}) NOT NULL
+    )
+  `);
+
+  // Create indexes
+  await client.execute(
+    `CREATE INDEX IF NOT EXISTS idx_chunks_doc ON chunks(doc_id)`
+  );
+  await client.execute(
+    `CREATE INDEX IF NOT EXISTS idx_docs_path ON documents(path)`
+  );
+
+  // FTS5 virtual table for full-text search
+  await client.execute(`
+    CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts 
+    USING fts5(content, content='chunks', content_rowid='rowid')
+  `);
+
+  // Triggers to keep FTS5 in sync with chunks table
+  await client.execute(`
+    CREATE TRIGGER IF NOT EXISTS chunks_ai 
+    AFTER INSERT ON chunks 
+    BEGIN 
+      INSERT INTO chunks_fts(rowid, content) 
+      VALUES (new.rowid, new.content); 
+    END
+  `);
+
+  await client.execute(`
+    CREATE TRIGGER IF NOT EXISTS chunks_ad 
+    AFTER DELETE ON chunks 
+    BEGIN 
+      INSERT INTO chunks_fts(chunks_fts, rowid, content) 
+      VALUES('delete', old.rowid, old.content); 
+    END
+  `);
+
+  await client.execute(`
+    CREATE TRIGGER IF NOT EXISTS chunks_au 
+    AFTER UPDATE ON chunks 
+    BEGIN 
+      INSERT INTO chunks_fts(chunks_fts, rowid, content) 
+      VALUES('delete', old.rowid, old.content);
+      INSERT INTO chunks_fts(rowid, content) 
+      VALUES (new.rowid, new.content);
+    END
+  `);
+}
