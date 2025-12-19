@@ -3,7 +3,7 @@
  * PDF Brain CLI
  */
 
-import { Effect, Console } from "effect";
+import { Effect, Console, Layer } from "effect";
 import { mkdirSync, existsSync, readFileSync, readdirSync, statSync } from "fs";
 import { basename, extname, join, dirname } from "path";
 import { fileURLToPath } from "url";
@@ -19,6 +19,11 @@ import {
   type FileStatus,
   type IngestState,
 } from "./components/IngestProgress.js";
+import {
+  AutoTagger,
+  AutoTaggerLive,
+  type EnrichmentResult,
+} from "./services/AutoTagger.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const pkg = JSON.parse(
@@ -243,6 +248,8 @@ Commands:
   ingest <directory>      Batch ingest PDFs/Markdown from directory
     --recursive           Include subdirectories (default: true)
     --tags <tags>         Apply tags to all ingested files
+    --auto-tag            Auto-generate tags using LLM (local first)
+    --enrich              Full enrichment: title, summary, tags (slower)
     --sample <n>          Process only first N files (for testing)
     --no-tui              Disable TUI, use simple progress output
 
@@ -269,7 +276,8 @@ Examples:
   pdf-brain search "error handling" --expand 2000
   pdf-brain stats
   pdf-brain ingest ~/Documents/books --tags "books"
-  pdf-brain ingest ./papers --sample 5 --no-tui
+  pdf-brain ingest ./papers --auto-tag --sample 5
+  pdf-brain ingest ./books --enrich  # Full metadata extraction
 `;
 
 function parseArgs(args: string[]) {
@@ -731,13 +739,15 @@ const program = Effect.gen(function* () {
 
       const opts = parseArgs(args.slice(2));
       const recursive = opts.recursive !== false; // default true
-      const tags = opts.tags
+      const manualTags = opts.tags
         ? (opts.tags as string).split(",").map((t) => t.trim())
         : undefined;
       const sampleSize = opts.sample
         ? parseInt(opts.sample as string, 10)
         : undefined;
       const useTui = opts["no-tui"] !== true;
+      const autoTag = opts["auto-tag"] === true;
+      const enrich = opts.enrich === true;
 
       // Discover files
       yield* Console.log(`Scanning ${targetDir}...`);
@@ -832,14 +842,56 @@ const program = Effect.gen(function* () {
             tui.update({ currentFile });
 
             try {
+              // Get tags - either manual, auto-generated, or none
+              let fileTags = manualTags ? [...manualTags] : [];
+              let title: string | undefined;
+
+              if (autoTag || enrich) {
+                const tagger = yield* AutoTagger;
+                const ext = extname(filePath).toLowerCase();
+                let content: string | undefined;
+
+                // Read content for markdown files
+                if (ext === ".md" || ext === ".markdown") {
+                  try {
+                    content = yield* Effect.promise(() =>
+                      Bun.file(filePath).text()
+                    );
+                  } catch {
+                    content = undefined;
+                  }
+                }
+
+                if (enrich && content) {
+                  const enrichResult = yield* tagger.enrich(filePath, content, {
+                    basePath: targetDir,
+                  });
+                  title = enrichResult.title;
+                  fileTags = [...fileTags, ...enrichResult.tags];
+                } else {
+                  const tagResult = yield* tagger.generateTags(
+                    filePath,
+                    content,
+                    {
+                      heuristicsOnly: !content,
+                      basePath: targetDir,
+                    }
+                  );
+                  fileTags = [...fileTags, ...tagResult.allTags];
+                }
+              }
+
               // Add the file
               const doc = yield* library.add(
                 filePath,
-                new AddOptions({ tags })
+                new AddOptions({
+                  title,
+                  tags: fileTags.length > 0 ? fileTags : undefined,
+                })
               );
 
               currentFile.status = "done";
-              currentFile.chunks = doc.pageCount; // Approximate
+              currentFile.chunks = doc.pageCount;
 
               tui.update({
                 processedFiles: i + 1,
@@ -889,11 +941,74 @@ const program = Effect.gen(function* () {
           processed++;
 
           try {
+            const mode = enrich ? "enrich" : autoTag ? "auto-tag" : "manual";
             yield* Console.log(
-              `[${processed}/${files.length}] Adding: ${filename}`
+              `[${processed}/${files.length}] Adding: ${filename}${
+                mode !== "manual" ? ` (${mode})` : ""
+              }`
             );
-            const doc = yield* library.add(filePath, new AddOptions({ tags }));
+
+            // Start with manual tags
+            let fileTags = manualTags ? [...manualTags] : [];
+            let title: string | undefined;
+
+            // For auto-tag or enrich, we need to read content first
+            if (autoTag || enrich) {
+              const tagger = yield* AutoTagger;
+
+              // Read file content for LLM analysis
+              const ext = extname(filePath).toLowerCase();
+              let content: string | undefined;
+
+              try {
+                if (ext === ".pdf") {
+                  // For PDFs, we'll use heuristics + path tags
+                  // Full content extraction happens during add
+                  content = undefined;
+                } else {
+                  // For markdown, read directly
+                  content = yield* Effect.promise(() =>
+                    Bun.file(filePath).text()
+                  );
+                }
+              } catch {
+                content = undefined;
+              }
+
+              if (enrich && content) {
+                // Full enrichment with LLM
+                const enrichResult = yield* tagger.enrich(filePath, content, {
+                  basePath: targetDir,
+                });
+                title = enrichResult.title;
+                fileTags = [...fileTags, ...enrichResult.tags];
+                yield* Console.log(`    Title: ${enrichResult.title}`);
+                yield* Console.log(`    Tags: ${enrichResult.tags.join(", ")}`);
+              } else {
+                // Just auto-tag (heuristics + optional LLM)
+                const tagResult = yield* tagger.generateTags(
+                  filePath,
+                  content,
+                  {
+                    heuristicsOnly: !content, // Use LLM if we have content
+                    basePath: targetDir,
+                  }
+                );
+                fileTags = [...fileTags, ...tagResult.allTags];
+              }
+            }
+
+            const doc = yield* library.add(
+              filePath,
+              new AddOptions({
+                title,
+                tags: fileTags.length > 0 ? fileTags : undefined,
+              })
+            );
             yield* Console.log(`  ✓ ${doc.title} (${doc.pageCount} pages)`);
+            if (fileTags.length > 0) {
+              yield* Console.log(`    Tags: ${doc.tags.join(", ")}`);
+            }
           } catch (error) {
             errors++;
             const msg = error instanceof Error ? error.message : String(error);
@@ -1170,7 +1285,7 @@ a background process that owns the database and exposes it via Unix socket.
   // Run with error handling
   Effect.runPromise(
     program.pipe(
-      Effect.provide(PDFLibraryLive),
+      Effect.provide(Layer.merge(PDFLibraryLive, AutoTaggerLive)),
       Effect.scoped,
       Effect.catchAll((error: unknown) =>
         Effect.gen(function* () {

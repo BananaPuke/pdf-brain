@@ -18,6 +18,8 @@
     "release": "bun test && bun run typecheck && changeset publish"
   },
   "dependencies": {
+    "@ai-sdk/anthropic": "^2.0.56",
+    "@ai-sdk/openai-compatible": "^1.0.29",
     "@effect/platform": "^0.72.0",
     "@effect/platform-bun": "^0.52.0",
     "@effect/schema": "^0.75.0",
@@ -25,6 +27,7 @@
     "@electric-sql/pglite-socket": "^0.0.19",
     "@electric-sql/pglite-tools": "^0.2.19",
     "@types/pg": "^8.16.0",
+    "ai": "^5.0.115",
     "effect": "^3.12.0",
     "gray-matter": "^4.0.3",
     "ink": "^6.5.1",
