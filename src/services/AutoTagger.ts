@@ -11,11 +11,16 @@
  * Strategy: Local LLM first (Ollama), fallback to Anthropic Haiku
  */
 
-import { anthropic } from "@ai-sdk/anthropic";
+// AI Gateway uses model strings directly, no provider import needed
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { generateObject, generateText } from "ai";
 import { Context, Effect, Layer } from "effect";
 import { z } from "zod";
+import {
+  TaxonomyService,
+  generateConceptEmbedding,
+} from "./TaxonomyService.js";
+import { Ollama } from "./Ollama.js";
 
 // ============================================================================
 // Types
@@ -115,7 +120,7 @@ export interface EnrichmentOptions {
 /** Default models per provider */
 const DEFAULT_MODELS: Record<LLMProvider, string> = {
   ollama: "llama3.2:3b",
-  anthropic: "claude-3-5-haiku-latest",
+  anthropic: "anthropic/claude-haiku-4-5",
 };
 
 /** Ollama base URL */
@@ -362,7 +367,9 @@ function getModel(provider: LLMProvider, modelName?: string) {
   if (provider === "ollama") {
     return createOllamaProvider()(model);
   }
-  return anthropic(model);
+  // AI Gateway - just pass the model string like "anthropic/claude-haiku-4-5"
+  // Vercel AI SDK picks it up automatically
+  return model as any;
 }
 
 // ============================================================================
@@ -579,6 +586,132 @@ function formatConceptsForPrompt(concepts: TaxonomyConcept[]): string {
 }
 
 /**
+ * Auto-accept novel proposed concepts after deduplication check
+ * Uses embedding similarity to detect duplicates (threshold 0.85)
+ *
+ * @returns Effect with count of accepted and rejected proposals
+ */
+function autoAcceptProposals(
+  proposals: ProposedConcept[]
+): Effect.Effect<
+  { accepted: number; rejected: number },
+  EnrichmentError,
+  TaxonomyService | Ollama
+> {
+  return Effect.gen(function* () {
+    if (proposals.length === 0) {
+      return { accepted: 0, rejected: 0 };
+    }
+
+    const taxonomy = yield* TaxonomyService;
+    const ollama = yield* Ollama;
+
+    let accepted = 0;
+    let rejected = 0;
+
+    for (const proposal of proposals) {
+      // Generate embedding for proposal
+      const proposalText = proposal.definition
+        ? `${proposal.prefLabel}: ${proposal.definition}`
+        : proposal.prefLabel;
+
+      const embedding = yield* ollama.embed(proposalText);
+
+      // Check for duplicates (similarity > 0.85)
+      const similar = yield* taxonomy.findSimilarConcepts(embedding, 0.85);
+
+      if (similar.length > 0) {
+        // Duplicate detected - skip
+        console.log(
+          `  [AutoTagger] Rejected duplicate proposal "${proposal.prefLabel}" (similar to "${similar[0].prefLabel}")`
+        );
+        rejected++;
+        continue;
+      }
+
+      // Novel concept - accept
+      yield* taxonomy.addConcept({
+        id: proposal.id,
+        prefLabel: proposal.prefLabel,
+        altLabels: proposal.altLabels,
+        definition: proposal.definition,
+      });
+      yield* taxonomy.storeConceptEmbedding(proposal.id, embedding);
+
+      console.log(
+        `  [AutoTagger] Accepted novel concept: ${proposal.id} - "${proposal.prefLabel}"`
+      );
+      accepted++;
+    }
+
+    return { accepted, rejected };
+  }).pipe(
+    Effect.mapError(
+      (e) =>
+        new EnrichmentError(
+          `Auto-accept failed: ${
+            "_tag" in e && e._tag === "OllamaError"
+              ? e.reason
+              : "_tag" in e && e._tag === "TaxonomyError"
+              ? e.reason
+              : String(e)
+          }`,
+          e
+        )
+    )
+  );
+}
+
+/**
+ * Extract RAG context: Find relevant concepts using document content embedding
+ *
+ * @param content - Document content (first ~2000 chars)
+ * @returns Effect with relevant concepts for LLM context
+ */
+function extractRAGContext(
+  content: string
+): Effect.Effect<TaxonomyConcept[], EnrichmentError, TaxonomyService | Ollama> {
+  return Effect.gen(function* () {
+    const ollama = yield* Ollama;
+    const taxonomy = yield* TaxonomyService;
+
+    // Extract sample (~2000 chars)
+    const sample = content.slice(0, 2000);
+
+    // Generate embedding for content
+    const embedding = yield* ollama.embed(sample);
+
+    // Find similar concepts (threshold 0.5 for broader matching)
+    const conceptsFromDB = yield* taxonomy.findSimilarConcepts(
+      embedding,
+      0.5,
+      5
+    );
+
+    // Convert to TaxonomyConcept interface
+    return conceptsFromDB.map((c) => ({
+      id: c.id,
+      prefLabel: c.prefLabel,
+      altLabels: c.altLabels,
+    }));
+  }).pipe(
+    Effect.mapError(
+      (e) =>
+        new EnrichmentError(
+          `RAG context extraction failed: ${
+            "_tag" in e && e._tag === "OllamaError"
+              ? e.reason
+              : "_tag" in e && e._tag === "TaxonomyError"
+              ? e.reason
+              : String(e)
+          }`,
+          e
+        )
+    )
+  );
+}
+
+/**
  * Generate full enrichment using LLM
  * Uses generateText for better compatibility with local models
  */
@@ -607,11 +740,20 @@ ${truncatedContent}
 ${conceptsList}
 
 Extract:
-- title, author (if present), summary (2-3 sentences)
-- documentType (book/paper/tutorial/reference/guide/article/report/presentation/notes/other)
-- category, tags (5-10 descriptive tags for backward compatibility)
-- concepts: array of concept IDs from the available concepts above that match this document's topics
-- proposedConcepts: if the document covers topics NOT in the taxonomy, suggest new concepts to add (with id, prefLabel, optional altLabels/definition)`,
+- title: Clean, properly formatted title
+- author: Author name(s) if identifiable
+- summary: 2-3 sentences
+- documentType: book/paper/tutorial/reference/guide/article/report/presentation/notes/other
+- category: Primary category (lowercase-hyphenated)
+- tags: 5-10 specific tags (lowercase-hyphenated)
+- concepts: Match IDs from the available concepts list above
+- proposedConcepts: ONLY if document covers topics truly missing from taxonomy
+
+For proposedConcepts, use SKOS-style short IDs:
+- id: "parent/child" format, 2-3 words max (e.g., "education/spaced-repetition", "programming/error-handling")
+- prefLabel: 1-3 words (e.g., "Spaced Repetition", "Error Handling")
+- definition: One sentence max
+Do NOT propose concepts that are variations of existing ones.`,
     });
 
     return {
@@ -622,38 +764,85 @@ Extract:
       category: normalizeTag(object.category),
       tags: object.tags.map(normalizeTag).filter((t) => t.length >= 2),
       concepts: object.concepts,
-      proposedConcepts: object.proposedConcepts,
+      proposedConcepts: validateProposedConcepts(object.proposedConcepts),
     };
   }
 
-  // For local models, use generateText with JSON prompt
+  // For local models, use generateText with JSON prompt and multishot examples
   const { text } = await generateText({
     model: getModel(provider, model),
-    prompt: `Analyze this document and return a JSON object with metadata.
+    prompt: `<role>You are a librarian cataloging documents for a personal knowledge library.</role>
 
-Filename: ${filename}
-
-Content (excerpt):
-${truncatedContent}
-
+<taxonomy>
 ${conceptsList}
+</taxonomy>
 
-Return ONLY a JSON object with these fields:
-{
-  "title": "Clean document title",
-  "author": "Author name or null",
-  "summary": "2-3 sentence summary",
-  "documentType": "book|paper|tutorial|reference|guide|article|report|presentation|notes|other",
-  "category": "primary-category",
-  "tags": ["tag1", "tag2", "tag3", "tag4", "tag5"],
-  "concepts": ["concept-id-1", "concept-id-2"],
-  "proposedConcepts": [{"id": "new/concept", "prefLabel": "New Concept", "altLabels": ["alias1"], "definition": "Description"}]
-}
+<instructions>
+Analyze the document and return a JSON object with:
+- title: Clean, properly formatted title
+- author: Author name if identifiable, null otherwise
+- summary: 2-3 sentences describing the document's content and significance
+- documentType: book|paper|tutorial|reference|guide|article|report|presentation|notes|other
+- category: Primary category (lowercase-hyphenated)
+- tags: 5-10 specific tags (lowercase-hyphenated, no generic terms like "document" or "pdf")
+- concepts: IDs from the taxonomy above that apply to this document
+- proposedConcepts: New concepts ONLY if the document covers topics not in the taxonomy
+</instructions>
 
-Rules:
-- Use lowercase hyphenated tags. Be specific, avoid generic terms.
-- Match existing concept IDs from the list above when applicable
-- Propose new concepts if the document covers topics not in the taxonomy`,
+<rules>
+- concepts: Use ONLY IDs from the taxonomy list
+- proposedConcepts: Use "parent/short-name" format (2-3 words max). Valid parents: programming, education, design, business, meta, psychology, research, writing
+- If taxonomy covers the topics, leave proposedConcepts as empty array []
+</rules>
+
+<examples>
+<example>
+<input>
+Filename: cognitive_load_theory_sweller.pdf
+Content: This paper reviews cognitive load theory, which describes how working memory limitations affect learning...
+</input>
+<output>{"title":"Cognitive Load Theory","author":"John Sweller","summary":"Reviews cognitive load theory and its implications for instructional design. A foundational paper in educational psychology.","documentType":"paper","category":"education","tags":["cognitive-load","working-memory","instructional-design","learning-theory"],"concepts":["education/cognitive-load","education/learning-science"],"proposedConcepts":[]}</output>
+</example>
+
+<example>
+<input>
+Filename: react_server_components.pdf
+Content: React Server Components allow rendering on the server, reducing client bundle size...
+</input>
+<output>{"title":"React Server Components","author":null,"summary":"Technical guide to React Server Components architecture and implementation patterns. Covers streaming, data fetching, and bundle optimization.","documentType":"tutorial","category":"programming","tags":["react","server-components","performance","streaming","bundle-size"],"concepts":["programming/react"],"proposedConcepts":[{"id":"programming/server-components","prefLabel":"Server Components","definition":"UI components rendered on the server to reduce client bundle size."}]}</output>
+</example>
+
+<example>
+<input>
+Filename: bootstrapping_saas_patio11.pdf
+Content: Patrick McKenzie discusses strategies for bootstrapping software businesses without venture capital...
+</input>
+<output>{"title":"Bootstrapping SaaS Businesses","author":"Patrick McKenzie","summary":"Strategies for building profitable software businesses without external funding. Covers pricing, marketing, and sustainable growth.","documentType":"article","category":"business","tags":["bootstrapping","saas","pricing","indie-hacking","profitability"],"concepts":["business/bootstrapping","business/marketing"],"proposedConcepts":[]}</output>
+</example>
+
+<example>
+<input>
+Filename: information_architecture_rosenfeld.pdf
+Content: This book covers the principles of organizing information for websites and digital products...
+</input>
+<output>{"title":"Information Architecture for the Web","author":"Louis Rosenfeld","summary":"Comprehensive guide to organizing and structuring information in digital products. Covers navigation, labeling, and search systems.","documentType":"book","category":"design","tags":["information-architecture","ux","navigation","taxonomy","findability"],"concepts":["design/information-architecture"],"proposedConcepts":[]}</output>
+</example>
+
+<example>
+<input>
+Filename: spaced_repetition_memory.pdf
+Content: This research examines how spaced repetition systems improve long-term retention compared to massed practice...
+</input>
+<output>{"title":"Spaced Repetition and Memory","author":null,"summary":"Research on spaced repetition learning techniques and their effectiveness for long-term retention. Compares to traditional study methods.","documentType":"paper","category":"education","tags":["spaced-repetition","memory","retention","learning-techniques","flashcards"],"concepts":["education/learning-science"],"proposedConcepts":[{"id":"education/spaced-repetition","prefLabel":"Spaced Repetition","definition":"Learning technique using increasing intervals between reviews to optimize retention."}]}</output>
+</example>
+</examples>
+
+<document>
+Filename: ${filename}
+Content: ${truncatedContent}
+</document>
+
+Return ONLY the JSON object:`,
   });
 
   const parsed = parseJSONFromText(text) as {
@@ -667,6 +856,17 @@ Rules:
     proposedConcepts?: ProposedConcept[];
   };
 
+  // Debug: log raw proposed concepts before validation
+  if (parsed.proposedConcepts && parsed.proposedConcepts.length > 0) {
+    console.log(
+      `  [AutoTagger] Raw proposedConcepts: ${JSON.stringify(
+        parsed.proposedConcepts
+      )}`
+    );
+  }
+
+  const validatedConcepts = validateProposedConcepts(parsed.proposedConcepts);
+
   return {
     title: parsed.title || cleanTitle(filename),
     author: parsed.author || undefined,
@@ -675,8 +875,74 @@ Rules:
     category: normalizeTag(parsed.category || "uncategorized"),
     tags: (parsed.tags || []).map(normalizeTag).filter((t) => t.length >= 2),
     concepts: parsed.concepts || [],
-    proposedConcepts: parsed.proposedConcepts,
+    proposedConcepts: validatedConcepts,
   };
+}
+
+/**
+ * Validate proposed concept ID format
+ * Valid: "parent/short-name" with 2-4 words total, lowercase, hyphenated
+ * Invalid: titles, sentences, "new/concept", missing slash, spaces
+ */
+function isValidConceptId(id: string): boolean {
+  // Must have exactly one slash
+  if (!id.includes("/") || id.split("/").length !== 2) return false;
+
+  const [parent, child] = id.split("/");
+
+  // Parent must be a known category (1 word, lowercase)
+  const validParents = [
+    "programming",
+    "education",
+    "design",
+    "business",
+    "meta",
+    "psychology",
+    "research",
+    "writing",
+  ];
+  if (!validParents.includes(parent)) return false;
+
+  // Child must be short (1-3 words hyphenated, no spaces)
+  if (child.includes(" ")) return false;
+  if (child.length > 30) return false; // Too long
+  if (child === "concept" || child === "new") return false; // Generic garbage
+
+  // Must be lowercase
+  if (id !== id.toLowerCase()) return false;
+
+  // Count words (hyphen-separated)
+  const wordCount = child.split("-").length;
+  if (wordCount > 4) return false; // Too many words
+
+  return true;
+}
+
+/**
+ * Filter and validate proposed concepts from LLM output
+ * EXPORTED for testing
+ */
+export function validateProposedConcepts(
+  concepts: ProposedConcept[] | undefined
+): ProposedConcept[] {
+  if (!concepts || !Array.isArray(concepts)) return [];
+
+  return concepts.filter((c) => {
+    if (!c.id || !c.prefLabel) return false;
+    if (!isValidConceptId(c.id)) {
+      console.log(`  [AutoTagger] Rejected invalid concept ID: "${c.id}"`);
+      return false;
+    }
+    // prefLabel should be short (1-4 words)
+    const labelWords = c.prefLabel.trim().split(/\s+/).length;
+    if (labelWords > 5) {
+      console.log(
+        `  [AutoTagger] Rejected verbose prefLabel: "${c.prefLabel}"`
+      );
+      return false;
+    }
+    return true;
+  });
 }
 
 /**
@@ -753,17 +1019,25 @@ export class EnrichmentError {
 
 /**
  * AutoTagger service interface
+ *
+ * NOTE: enrich() now requires TaxonomyService and Ollama for auto-accept and RAG context
  */
 export interface AutoTagger {
   /**
    * Full document enrichment (title, summary, tags, etc.)
    * Uses local LLM first, falls back to Anthropic
+   *
+   * Requires: TaxonomyService and Ollama for auto-accept and RAG context
    */
   readonly enrich: (
     filePath: string,
     content: string,
     options?: EnrichmentOptions
-  ) => Effect.Effect<EnrichmentResult, EnrichmentError>;
+  ) => Effect.Effect<
+    EnrichmentResult,
+    EnrichmentError,
+    TaxonomyService | Ollama
+  >;
 
   /**
    * Lightweight tagging only
@@ -785,170 +1059,225 @@ export const AutoTagger = Context.GenericTag<AutoTagger>("AutoTagger");
 
 /**
  * Create the AutoTagger service
+ * Requires TaxonomyService and Ollama for auto-accept and RAG context
  */
-export const AutoTaggerLive = Layer.succeed(
+export const AutoTaggerLive = Layer.effect(
   AutoTagger,
-  AutoTagger.of({
-    enrich: (filePath: string, content: string, options?: EnrichmentOptions) =>
-      Effect.gen(function* () {
-        const filename = filePath.split("/").pop() || "";
-        const opts = options || {};
-        const availableConcepts = opts.availableConcepts || [];
+  Effect.gen(function* () {
+    return AutoTagger.of({
+      enrich: (
+        filePath: string,
+        content: string,
+        options?: EnrichmentOptions
+      ) =>
+        Effect.gen(function* () {
+          const filename = filePath.split("/").pop() || "";
+          const opts = options || {};
+          let availableConcepts = opts.availableConcepts || [];
 
-        // If heuristics only, build from extraction
-        if (opts.heuristicsOnly) {
-          const pathTags = extractPathTags(filePath, opts.basePath);
-          const filenameTags = extractFilenameTags(filename);
-          const contentTags = extractContentKeywords(content, 5);
+          // If heuristics only, build from extraction
+          if (opts.heuristicsOnly) {
+            const pathTags = extractPathTags(filePath, opts.basePath);
+            const filenameTags = extractFilenameTags(filename);
+            const contentTags = extractContentKeywords(content, 5);
 
-          return {
-            title: cleanTitle(filename),
-            author: extractAuthor(filename),
-            summary: content.slice(0, 200).replace(/\s+/g, " ").trim() + "...",
-            documentType: "other" as DocumentType,
-            category: pathTags[0] || "uncategorized",
-            tags: [
-              ...new Set([...pathTags, ...filenameTags, ...contentTags]),
-            ].slice(0, 10),
-            concepts: [],
-            confidence: 0.3,
-            provider: "ollama" as LLMProvider, // Placeholder
-          };
-        }
-
-        // Try local LLM first
-        let provider: LLMProvider = opts.provider || "ollama";
-        let model = opts.model;
-
-        if (provider === "ollama") {
-          const available = yield* Effect.promise(() => isOllamaAvailable());
-          if (!available) {
-            console.warn("Ollama not available, falling back to Anthropic");
-            provider = "anthropic";
-            model = undefined;
-          } else if (!model) {
-            // Check if default model is available
-            const modelAvailable = yield* Effect.promise(() =>
-              isModelAvailable(DEFAULT_MODELS.ollama)
-            );
-            if (!modelAvailable) {
-              console.warn(
-                `Model ${DEFAULT_MODELS.ollama} not available, falling back to Anthropic`
-              );
-              provider = "anthropic";
-            }
+            return {
+              title: cleanTitle(filename),
+              author: extractAuthor(filename),
+              summary:
+                content.slice(0, 200).replace(/\s+/g, " ").trim() + "...",
+              documentType: "other" as DocumentType,
+              category: pathTags[0] || "uncategorized",
+              tags: [
+                ...new Set([...pathTags, ...filenameTags, ...contentTags]),
+              ].slice(0, 10),
+              concepts: [],
+              confidence: 0.3,
+              provider: "ollama" as LLMProvider, // Placeholder
+            };
           }
-        }
 
-        // Run enrichment with available concepts
-        const result = yield* Effect.tryPromise({
-          try: () =>
-            enrichWithLLM(
-              filename,
-              content,
-              provider,
-              availableConcepts,
-              model
+          // STEP 1: Extract RAG context (relevant concepts from taxonomy)
+          // This helps LLM match existing concepts instead of proposing duplicates
+          const ragConcepts = yield* extractRAGContext(content).pipe(
+            Effect.catchAll(() =>
+              // If RAG extraction fails, continue with empty list
+              Effect.succeed([])
+            )
+          );
+
+          // Merge RAG concepts with provided concepts (RAG first for priority)
+          const conceptsForPrompt: TaxonomyConcept[] = [
+            ...ragConcepts,
+            ...availableConcepts.filter(
+              (c) => !ragConcepts.some((r) => r.id === c.id)
             ),
-          catch: (error) =>
-            new EnrichmentError(
-              `Enrichment failed: ${
-                error instanceof Error ? error.message : String(error)
-              }`,
-              error
-            ),
-        });
+          ];
 
-        return {
-          ...result,
-          confidence: provider === "ollama" ? 0.7 : 0.9,
-          provider,
-        };
-      }),
+          console.log(
+            `  [AutoTagger] RAG context: ${ragConcepts.length} relevant concepts found`
+          );
 
-    generateTags: (
-      filePath: string,
-      content?: string,
-      options?: EnrichmentOptions
-    ) =>
-      Effect.gen(function* () {
-        const filename = filePath.split("/").pop() || "";
-        const opts = options || {};
-
-        // Always extract heuristic tags
-        const pathTags = extractPathTags(filePath, opts.basePath);
-        const filenameTags = extractFilenameTags(filename);
-        const contentTags = content ? extractContentKeywords(content, 5) : [];
-        const author = extractAuthor(filename);
-
-        let llmTags: string[] = [];
-        let category: string | undefined;
-        let llmAuthor: string | undefined;
-
-        // Add LLM tags if not heuristics-only and we have content
-        if (!opts.heuristicsOnly && content) {
+          // Try local LLM first
           let provider: LLMProvider = opts.provider || "ollama";
           let model = opts.model;
 
           if (provider === "ollama") {
             const available = yield* Effect.promise(() => isOllamaAvailable());
             if (!available) {
+              console.warn("Ollama not available, falling back to Anthropic");
               provider = "anthropic";
               model = undefined;
+            } else if (!model) {
+              // Check if default model is available
+              const modelAvailable = yield* Effect.promise(() =>
+                isModelAvailable(DEFAULT_MODELS.ollama)
+              );
+              if (!modelAvailable) {
+                console.warn(
+                  `Model ${DEFAULT_MODELS.ollama} not available, falling back to Anthropic`
+                );
+                provider = "anthropic";
+              }
             }
           }
 
-          const llmResult = yield* Effect.tryPromise({
-            try: () => tagWithLLM(filename, content, provider, model),
+          // STEP 2: Run enrichment with RAG-enhanced concept list
+          const result = yield* Effect.tryPromise({
+            try: () =>
+              enrichWithLLM(
+                filename,
+                content,
+                provider,
+                conceptsForPrompt,
+                model
+              ),
             catch: (error) =>
               new EnrichmentError(
-                `LLM tagging failed: ${
+                `Enrichment failed: ${
                   error instanceof Error ? error.message : String(error)
                 }`,
                 error
               ),
-          }).pipe(
-            Effect.catchAll((error) => {
-              console.warn(
-                "LLM tagging failed, using heuristics only:",
-                error.message
+          });
+
+          // STEP 3: Auto-accept novel proposed concepts
+          const validatedProposals = result.proposedConcepts || [];
+          if (validatedProposals.length > 0) {
+            console.log(
+              `  [AutoTagger] Processing ${validatedProposals.length} proposed concepts...`
+            );
+
+            const { accepted, rejected } = yield* autoAcceptProposals(
+              validatedProposals
+            ).pipe(
+              Effect.catchAll((error) => {
+                // If auto-accept fails, log and continue (don't fail enrichment)
+                console.warn(
+                  `  [AutoTagger] Auto-accept failed: ${error.message}`
+                );
+                return Effect.succeed({ accepted: 0, rejected: 0 });
+              })
+            );
+
+            console.log(
+              `  [AutoTagger] Auto-accept results: ${accepted} accepted, ${rejected} rejected`
+            );
+          }
+
+          return {
+            ...result,
+            confidence: provider === "ollama" ? 0.7 : 0.9,
+            provider,
+          };
+        }),
+
+      generateTags: (
+        filePath: string,
+        content?: string,
+        options?: EnrichmentOptions
+      ) =>
+        Effect.gen(function* () {
+          const filename = filePath.split("/").pop() || "";
+          const opts = options || {};
+
+          // Always extract heuristic tags
+          const pathTags = extractPathTags(filePath, opts.basePath);
+          const filenameTags = extractFilenameTags(filename);
+          const contentTags = content ? extractContentKeywords(content, 5) : [];
+          const author = extractAuthor(filename);
+
+          let llmTags: string[] = [];
+          let category: string | undefined;
+          let llmAuthor: string | undefined;
+
+          // Add LLM tags if not heuristics-only and we have content
+          if (!opts.heuristicsOnly && content) {
+            let provider: LLMProvider = opts.provider || "ollama";
+            let model = opts.model;
+
+            if (provider === "ollama") {
+              const available = yield* Effect.promise(() =>
+                isOllamaAvailable()
               );
-              return Effect.succeed({
-                tags: [],
-                category: undefined,
-                author: undefined,
-              });
-            })
-          );
+              if (!available) {
+                provider = "anthropic";
+                model = undefined;
+              }
+            }
 
-          llmTags = llmResult.tags;
-          category = llmResult.category;
-          llmAuthor = llmResult.author;
-        }
+            const llmResult = yield* Effect.tryPromise({
+              try: () => tagWithLLM(filename, content, provider, model),
+              catch: (error) =>
+                new EnrichmentError(
+                  `LLM tagging failed: ${
+                    error instanceof Error ? error.message : String(error)
+                  }`,
+                  error
+                ),
+            }).pipe(
+              Effect.catchAll((error) => {
+                console.warn(
+                  "LLM tagging failed, using heuristics only:",
+                  error.message
+                );
+                return Effect.succeed({
+                  tags: [],
+                  category: undefined,
+                  author: undefined,
+                });
+              })
+            );
 
-        // Combine all tags (LLM first for priority)
-        const allTags = [
-          ...new Set([
-            ...llmTags,
-            ...pathTags,
-            ...filenameTags,
-            ...contentTags,
-          ]),
-        ]
-          .filter((t) => t.length >= 2)
-          .slice(0, 10);
+            llmTags = llmResult.tags;
+            category = llmResult.category;
+            llmAuthor = llmResult.author;
+          }
 
-        return {
-          pathTags,
-          filenameTags,
-          contentTags,
-          llmTags,
-          allTags,
-          author: llmAuthor || author,
-          category: category || pathTags[0],
-        };
-      }),
+          // Combine all tags (LLM first for priority)
+          const allTags = [
+            ...new Set([
+              ...llmTags,
+              ...pathTags,
+              ...filenameTags,
+              ...contentTags,
+            ]),
+          ]
+            .filter((t) => t.length >= 2)
+            .slice(0, 10);
 
-    isLocalAvailable: () => Effect.promise(() => isOllamaAvailable()),
+          return {
+            pathTags,
+            filenameTags,
+            contentTags,
+            llmTags,
+            allTags,
+            author: llmAuthor || author,
+            category: category || pathTags[0],
+          };
+        }),
+
+      isLocalAvailable: () => Effect.promise(() => isOllamaAvailable()),
+    });
   })
 );

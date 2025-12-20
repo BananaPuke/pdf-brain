@@ -10,8 +10,8 @@ import { createClient, type Client } from "@libsql/client";
 import { Database } from "./Database.js";
 import { DatabaseError, Document } from "../types.js";
 
-// Embedding dimension for mxbai-embed-large
-const EMBEDDING_DIM = 1024;
+// Embedding dimension for nomic-embed-text (used for both documents and concepts)
+const EMBEDDING_DIM = 768;
 
 // ============================================================================
 // LibSQLDatabase Service
@@ -635,6 +635,14 @@ async function initSchema(client: Client): Promise<void> {
     )
   `);
 
+  // Concept Embeddings - vector representations of concepts (unified with document embeddings)
+  await client.execute(`
+    CREATE TABLE IF NOT EXISTS concept_embeddings (
+      concept_id TEXT PRIMARY KEY REFERENCES concepts(id) ON DELETE CASCADE,
+      embedding F32_BLOB(${EMBEDDING_DIM}) NOT NULL
+    )
+  `);
+
   // Taxonomy indexes for efficient hierarchy traversal
   await client.execute(
     `CREATE INDEX IF NOT EXISTS idx_concept_hierarchy_concept ON concept_hierarchy(concept_id)`
@@ -653,6 +661,11 @@ async function initSchema(client: Client): Promise<void> {
   );
   await client.execute(
     `CREATE INDEX IF NOT EXISTS idx_document_concepts_concept ON document_concepts(concept_id)`
+  );
+
+  // Vector index for concept embeddings (same compression as document embeddings)
+  await client.execute(
+    `CREATE INDEX IF NOT EXISTS concept_embeddings_idx ON concept_embeddings(libsql_vector_idx(embedding, 'compress_neighbors=float8'))`
   );
 
   // Triggers to keep FTS5 in sync with chunks table

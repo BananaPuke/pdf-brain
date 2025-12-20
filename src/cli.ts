@@ -24,66 +24,8 @@ import {
   AutoTagger,
   AutoTaggerLive,
   type EnrichmentResult,
-  type ProposedConcept,
 } from "./services/AutoTagger.js";
 import { PDFExtractor, PDFExtractorLive } from "./services/PDFExtractor.js";
-import { writeFileSync } from "fs";
-
-// ============================================================================
-// Proposed Concepts Storage
-// ============================================================================
-
-interface ProposedConceptEntry extends ProposedConcept {
-  sourceDoc?: string;
-  proposedAt: string;
-  suggestedBroader?: string;
-}
-
-function getProposedConceptsPath(): string {
-  const config = LibraryConfig.fromEnv();
-  return join(config.libraryPath, "proposed-concepts.json");
-}
-
-function loadProposedConcepts(): ProposedConceptEntry[] {
-  const path = getProposedConceptsPath();
-  if (!existsSync(path)) return [];
-  try {
-    return JSON.parse(readFileSync(path, "utf-8")) as ProposedConceptEntry[];
-  } catch {
-    return [];
-  }
-}
-
-function saveProposedConcepts(concepts: ProposedConceptEntry[]): void {
-  const path = getProposedConceptsPath();
-  writeFileSync(path, JSON.stringify(concepts, null, 2));
-}
-
-function addProposedConcepts(
-  newConcepts: ProposedConcept[],
-  sourceDoc?: string
-): number {
-  const existing = loadProposedConcepts();
-  const existingIds = new Set(existing.map((c) => c.id));
-
-  let added = 0;
-  for (const concept of newConcepts) {
-    if (!existingIds.has(concept.id)) {
-      existing.push({
-        ...concept,
-        sourceDoc,
-        proposedAt: new Date().toISOString(),
-      });
-      existingIds.add(concept.id);
-      added++;
-    }
-  }
-
-  if (added > 0) {
-    saveProposedConcepts(existing);
-  }
-  return added;
-}
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const pkg = JSON.parse(
@@ -105,6 +47,7 @@ import {
   type TaxonomyJSON,
   type Concept,
 } from "./services/TaxonomyService.js";
+import { Ollama, OllamaLive } from "./services/Ollama.js";
 
 /**
  * Check if a string is a URL
@@ -481,12 +424,14 @@ Commands:
     --title <title>       Custom title (default: filename or frontmatter)
     --tags <tags>         Comma-separated tags
 
-  search <query>          Semantic search across all documents
+  search <query>          Unified search across documents and concepts
     --limit <n>           Max results (default: 10)
-    --tag <tag>           Filter by tag
+    --tag <tag>           Filter documents by tag
     --fts                 Full-text search only (skip embeddings)
     --expand <chars>      Expand context around matches (max: 4000)
                           Returns surrounding chunks up to char budget
+    --concepts-only       Search only taxonomy concepts
+    --docs-only           Search only documents (skip concepts)
 
   list                    List all documents in the library
     --tag <tag>           Filter by tag
@@ -559,6 +504,8 @@ Examples:
   pdf-brain add https://example.com/paper.pdf --title "Research Paper"
   pdf-brain search "machine learning" --limit 5
   pdf-brain search "error handling" --expand 2000
+  pdf-brain search "design patterns" --concepts-only  # Search concepts only
+  pdf-brain search "react hooks" --docs-only          # Search documents only
   pdf-brain stats
   pdf-brain ingest ~/Documents/books --tags "books"
   pdf-brain ingest ./papers --auto-tag --sample 5
@@ -646,9 +593,67 @@ const program = Effect.gen(function* () {
       }
 
       yield* Console.log(`Adding: ${localPath}`);
+
+      // Handle --enrich flag
+      const enrich = opts.enrich === true;
+      const forceProvider = opts.provider as "ollama" | "anthropic" | undefined;
+      let enrichedTitle = title;
+      let enrichedTags = tags || [];
+
+      if (enrich) {
+        const providerLabel = forceProvider || "auto";
+        yield* Console.log(`  Enriching with LLM (${providerLabel})...`);
+        const tagger = yield* AutoTagger;
+        const pdfExtractor = yield* PDFExtractor;
+        const ext = extname(localPath).toLowerCase();
+        let content: string | undefined;
+
+        if (ext === ".pdf") {
+          const extractResult = yield* Effect.either(
+            pdfExtractor.extract(localPath)
+          );
+          if (extractResult._tag === "Right") {
+            const pages = extractResult.right.pages.slice(0, 10);
+            content = pages.map((p) => p.text).join("\n\n");
+            if (content.length > 8000) {
+              content = content.slice(0, 8000);
+            }
+          }
+        } else if (ext === ".md" || ext === ".markdown") {
+          const readResult = yield* Effect.either(
+            Effect.promise(() => Bun.file(localPath).text())
+          );
+          if (readResult._tag === "Right") {
+            content = readResult.right;
+          }
+        }
+
+        if (content) {
+          const enrichResult = yield* tagger.enrich(localPath, content, {
+            provider: forceProvider,
+          });
+          enrichedTitle = enrichedTitle || enrichResult.title;
+          enrichedTags = [...enrichedTags, ...enrichResult.tags];
+          yield* Console.log(`  Title: ${enrichResult.title}`);
+          yield* Console.log(`  Summary: ${enrichResult.summary}`);
+          // Proposed concepts are now auto-accepted in AutoTagger
+          if (
+            enrichResult.proposedConcepts &&
+            enrichResult.proposedConcepts.length > 0
+          ) {
+            yield* Console.log(
+              `  Auto-accepted ${enrichResult.proposedConcepts.length} concept(s)`
+            );
+          }
+        }
+      }
+
       const doc = yield* library.add(
         localPath,
-        new AddOptions({ title, tags })
+        new AddOptions({
+          title: enrichedTitle,
+          tags: enrichedTags.length > 0 ? enrichedTags : undefined,
+        })
       );
       yield* Console.log(`✓ Added: ${doc.title}`);
       yield* Console.log(`  ID: ${doc.id}`);
@@ -674,44 +679,120 @@ const program = Effect.gen(function* () {
       const expandChars = opts.expand
         ? Math.min(4000, Math.max(0, parseInt(opts.expand as string, 10)))
         : 0;
+      const conceptsOnly = opts["concepts-only"] === true;
+      const docsOnly = opts["docs-only"] === true;
+
+      // Determine what to search
+      const searchDocs = !conceptsOnly;
+      const searchConcepts = !docsOnly;
+
+      const modeLabel = conceptsOnly
+        ? " (concepts only)"
+        : docsOnly
+        ? " (docs only)"
+        : "";
 
       yield* Console.log(
-        `Searching: "${query}"${ftsOnly ? " (FTS only)" : ""}${
+        `Searching: "${query}"${ftsOnly ? " (FTS only)" : ""}${modeLabel}${
           expandChars > 0 ? ` (expand: ${expandChars} chars)` : ""
         }\n`
       );
 
-      const results = ftsOnly
-        ? yield* library.ftsSearch(query, new SearchOptions({ limit, tags }))
-        : yield* library.search(
-            query,
-            new SearchOptions({ limit, tags, hybrid: true, expandChars })
-          );
+      // Search concepts first (if enabled)
+      if (searchConcepts) {
+        const taxonomy = yield* TaxonomyService;
+        const ollamaService = yield* Ollama;
 
-      if (results.length === 0) {
-        yield* Console.log("No results found");
-      } else {
-        for (const r of results) {
-          yield* Console.log(
-            `[${r.score.toFixed(3)}] ${r.title} (p.${r.page})`
-          );
-
-          if (r.expandedContent && expandChars > 0) {
-            // Show expanded content with range info
-            const rangeInfo = r.expandedRange
-              ? ` [chunks ${r.expandedRange.start}-${r.expandedRange.end}]`
-              : "";
-            yield* Console.log(`  --- Expanded context${rangeInfo} ---`);
-            yield* Console.log(`  ${r.expandedContent.replace(/\n/g, "\n  ")}`);
-            yield* Console.log(`  --- End context ---`);
-          } else {
-            // Default: truncated snippet
-            yield* Console.log(
-              `  ${r.content.slice(0, 200).replace(/\n/g, " ")}...`
+        // Try vector search on concepts using Ollama embeddings
+        const conceptResults = yield* Effect.gen(function* () {
+          const healthCheck = yield* Effect.either(ollamaService.checkHealth());
+          if (healthCheck._tag === "Right") {
+            const queryEmbedding = yield* ollamaService.embed(query);
+            const similar = yield* taxonomy.findSimilarConcepts(
+              queryEmbedding,
+              0.3, // Lower threshold for broader results
+              limit
             );
+            return similar;
           }
-          yield* Console.log("");
+          // Fallback to text search on concepts if Ollama unavailable
+          const allConcepts = yield* taxonomy.listConcepts();
+          const queryLower = query.toLowerCase();
+          return allConcepts
+            .filter(
+              (c) =>
+                c.prefLabel.toLowerCase().includes(queryLower) ||
+                c.altLabels.some((alt) =>
+                  alt.toLowerCase().includes(queryLower)
+                ) ||
+                (c.definition &&
+                  c.definition.toLowerCase().includes(queryLower))
+            )
+            .slice(0, limit);
+        }).pipe(Effect.catchAll(() => Effect.succeed([] as Concept[])));
+
+        if (conceptResults.length > 0) {
+          yield* Console.log(`📚 Concepts (${conceptResults.length}):\n`);
+          for (const c of conceptResults) {
+            yield* Console.log(`🏷️  ${c.prefLabel} (${c.id})`);
+            if (c.definition) {
+              yield* Console.log(
+                `    ${c.definition.slice(0, 150).replace(/\n/g, " ")}${
+                  c.definition.length > 150 ? "..." : ""
+                }`
+              );
+            }
+            yield* Console.log("");
+          }
         }
+      }
+
+      // Search documents (if enabled)
+      if (searchDocs) {
+        const results = ftsOnly
+          ? yield* library.ftsSearch(query, new SearchOptions({ limit, tags }))
+          : yield* library.search(
+              query,
+              new SearchOptions({ limit, tags, hybrid: true, expandChars })
+            );
+
+        if (results.length > 0) {
+          if (searchConcepts) {
+            yield* Console.log(`📄 Documents (${results.length}):\n`);
+          }
+          for (const r of results) {
+            yield* Console.log(
+              `[${r.score.toFixed(3)}] ${r.title} (p.${r.page})`
+            );
+
+            if (r.expandedContent && expandChars > 0) {
+              // Show expanded content with range info
+              const rangeInfo = r.expandedRange
+                ? ` [chunks ${r.expandedRange.start}-${r.expandedRange.end}]`
+                : "";
+              yield* Console.log(`  --- Expanded context${rangeInfo} ---`);
+              yield* Console.log(
+                `  ${r.expandedContent.replace(/\n/g, "\n  ")}`
+              );
+              yield* Console.log(`  --- End context ---`);
+            } else {
+              // Default: truncated snippet
+              yield* Console.log(
+                `  ${r.content.slice(0, 200).replace(/\n/g, " ")}...`
+              );
+            }
+            yield* Console.log("");
+          }
+        } else if (!searchConcepts) {
+          yield* Console.log("No results found");
+        }
+      }
+
+      // If no results at all
+      if (conceptsOnly) {
+        // Already handled above
+      } else if (docsOnly) {
+        // Already handled above
       }
       break;
     }
@@ -1564,22 +1645,16 @@ const program = Effect.gen(function* () {
                       .join(", ")}`
                   );
                 }
-                // Save proposed concepts for later review
+                // Proposed concepts are now auto-accepted in AutoTagger
                 if (
                   enrichResult.proposedConcepts &&
                   enrichResult.proposedConcepts.length > 0
                 ) {
-                  const added = addProposedConcepts(
-                    enrichResult.proposedConcepts,
-                    filePath
+                  yield* Console.log(
+                    `    Auto-accepted: ${enrichResult.proposedConcepts
+                      .map((c) => c.prefLabel)
+                      .join(", ")}`
                   );
-                  if (added > 0) {
-                    yield* Console.log(
-                      `    Proposed: ${enrichResult.proposedConcepts
-                        .map((c) => c.prefLabel)
-                        .join(", ")}`
-                    );
-                  }
                 }
               } else if (enrich && !content) {
                 // Enrichment requested but no content - fall back to heuristics
@@ -1844,142 +1919,6 @@ if (args[0] === "taxonomy") {
         break;
       }
 
-      case "proposed": {
-        const proposed = loadProposedConcepts();
-
-        if (proposed.length === 0) {
-          yield* Console.log("No proposed concepts yet.");
-          yield* Console.log(
-            "\nProposed concepts are collected during enrichment."
-          );
-          yield* Console.log(
-            "Run 'pdf-brain ingest <dir> --enrich' to generate proposals."
-          );
-          break;
-        }
-
-        yield* Console.log(`Proposed Concepts: ${proposed.length}\n`);
-
-        for (let i = 0; i < proposed.length; i++) {
-          const p = proposed[i];
-          yield* Console.log(`[${i + 1}] ${p.prefLabel} (${p.id})`);
-          if (p.definition) {
-            yield* Console.log(`    ${p.definition}`);
-          }
-          if (p.altLabels && p.altLabels.length > 0) {
-            yield* Console.log(`    Aliases: ${p.altLabels.join(", ")}`);
-          }
-          if (p.sourceDoc) {
-            yield* Console.log(`    Source: ${basename(p.sourceDoc)}`);
-          }
-        }
-
-        yield* Console.log(`\nTo accept a concept:`);
-        yield* Console.log(
-          `  pdf-brain taxonomy accept <id> [--broader <parent>]`
-        );
-        yield* Console.log(`\nTo accept all:`);
-        yield* Console.log(`  pdf-brain taxonomy accept --all`);
-        yield* Console.log(`\nTo clear proposals:`);
-        yield* Console.log(`  pdf-brain taxonomy clear-proposed`);
-        break;
-      }
-
-      case "accept": {
-        const conceptId = args[2];
-        const acceptAll = opts.all === true;
-        const broader = opts.broader as string | undefined;
-
-        if (!conceptId && !acceptAll) {
-          yield* Console.error("Error: Concept ID or --all required");
-          yield* Console.error(
-            "Usage: pdf-brain taxonomy accept <id> [--broader <parent>]"
-          );
-          yield* Console.error("       pdf-brain taxonomy accept --all");
-          process.exit(1);
-        }
-
-        const proposed = loadProposedConcepts();
-
-        if (proposed.length === 0) {
-          yield* Console.log("No proposed concepts to accept.");
-          break;
-        }
-
-        let accepted = 0;
-        const remaining: ProposedConceptEntry[] = [];
-
-        for (const p of proposed) {
-          if (acceptAll || p.id === conceptId) {
-            // Add to taxonomy
-            yield* taxonomy.addConcept({
-              id: p.id,
-              prefLabel: p.prefLabel,
-              altLabels: p.altLabels || [],
-              definition: p.definition,
-            });
-
-            // Add hierarchy if specified or suggested
-            const parentId = broader || p.suggestedBroader;
-            if (parentId) {
-              const parentResult = yield* Effect.either(
-                taxonomy.addBroader(p.id, parentId)
-              );
-              if (parentResult._tag === "Left") {
-                yield* Console.log(
-                  `  ⚠ Could not set parent ${parentId} for ${p.id}`
-                );
-              }
-            }
-
-            yield* Console.log(`✓ Added: ${p.prefLabel} (${p.id})`);
-            accepted++;
-          } else {
-            remaining.push(p);
-          }
-        }
-
-        saveProposedConcepts(remaining);
-        yield* Console.log(
-          `\nAccepted ${accepted} concept(s), ${remaining.length} remaining.`
-        );
-        break;
-      }
-
-      case "reject": {
-        const conceptId = args[2];
-
-        if (!conceptId) {
-          yield* Console.error("Error: Concept ID required");
-          yield* Console.error("Usage: pdf-brain taxonomy reject <id>");
-          process.exit(1);
-        }
-
-        const proposed = loadProposedConcepts();
-        const remaining = proposed.filter((p) => p.id !== conceptId);
-
-        if (remaining.length === proposed.length) {
-          yield* Console.log(`Concept not found in proposals: ${conceptId}`);
-        } else {
-          saveProposedConcepts(remaining);
-          yield* Console.log(`✓ Rejected: ${conceptId}`);
-        }
-        break;
-      }
-
-      case "clear-proposed": {
-        const proposed = loadProposedConcepts();
-        if (proposed.length === 0) {
-          yield* Console.log("No proposed concepts to clear.");
-        } else {
-          saveProposedConcepts([]);
-          yield* Console.log(
-            `✓ Cleared ${proposed.length} proposed concept(s).`
-          );
-        }
-        break;
-      }
-
       case "seed": {
         const filePath = (opts.file as string) || "data/taxonomy.json";
 
@@ -2091,14 +2030,20 @@ if (args[0] === "taxonomy") {
   );
 } else {
   // Run with error handling
+  // AutoTagger now requires TaxonomyService and Ollama for auto-accept
+  const config = LibraryConfig.fromEnv();
+  const TaxonomyServiceLive = TaxonomyServiceImpl.make({
+    url: `file:${config.dbPath}`,
+  });
+
+  const AppLayer = Layer.merge(
+    Layer.merge(Layer.merge(PDFLibraryLive, AutoTaggerLive), PDFExtractorLive),
+    Layer.merge(TaxonomyServiceLive, OllamaLive)
+  );
+
   Effect.runPromise(
     program.pipe(
-      Effect.provide(
-        Layer.merge(
-          Layer.merge(PDFLibraryLive, AutoTaggerLive),
-          PDFExtractorLive
-        )
-      ),
+      Effect.provide(AppLayer),
       Effect.scoped,
       Effect.catchAll((error: unknown) =>
         Effect.gen(function* () {

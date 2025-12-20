@@ -31,10 +31,10 @@ describe("LibSQLDatabase", () => {
       expect(result).toBe("created");
     });
 
-    test("embeddings table uses F32_BLOB(1024) column type, not TEXT", async () => {
+    test("embeddings table uses F32_BLOB(768) column type for nomic-embed-text", async () => {
       // REGRESSION PREVENTION TEST
       // Root cause: Old PGLite code used TEXT for embeddings.
-      // libSQL requires F32_BLOB(1024) for vector search.
+      // libSQL requires F32_BLOB(768) for vector search with nomic-embed-text.
       // If TEXT is used, vector search hangs.
       //
       // This test verifies the actual schema by querying sqlite_master
@@ -57,12 +57,12 @@ describe("LibSQLDatabase", () => {
 
       client.close();
 
-      // Verify schema contains F32_BLOB(1024), not TEXT
+      // Verify schema contains F32_BLOB(768), not TEXT
       expect(result.rows.length).toBe(1);
       const schema = result.rows[0].sql as string;
 
-      // CRITICAL: Must use F32_BLOB(1024) for libSQL vector operations
-      expect(schema).toContain("F32_BLOB(1024)");
+      // CRITICAL: Must use F32_BLOB(768) for libSQL vector operations with nomic-embed-text
+      expect(schema).toContain("F32_BLOB(768)");
 
       // MUST NOT use TEXT (PGLite legacy schema)
       expect(schema).not.toContain("embedding TEXT");
@@ -557,6 +557,58 @@ describe("LibSQLDatabase", () => {
       const results = await Effect.runPromise(Effect.provide(program, layer));
 
       expect(results).toHaveLength(0);
+    });
+  });
+
+  describe("concept embeddings schema", () => {
+    test("concept_embeddings table exists with F32_BLOB(768)", async () => {
+      // RED TEST: Verify concept embeddings use same 768-dim as nomic-embed-text
+      const program = Effect.gen(function* () {
+        yield* Database; // Force initialization
+        return "db-initialized";
+      });
+
+      const layer = LibSQLDatabase.make({ url: "file::memory:?cache=shared" });
+      await Effect.runPromise(Effect.provide(program, layer));
+
+      // Query schema
+      const client = createClient({ url: "file::memory:?cache=shared" });
+      const result = await client.execute({
+        sql: "SELECT sql FROM sqlite_master WHERE type='table' AND name='concept_embeddings'",
+        args: [],
+      });
+
+      client.close();
+
+      expect(result.rows.length).toBe(1);
+      const schema = result.rows[0].sql as string;
+
+      // Verify 768 dimensions (nomic-embed-text)
+      expect(schema).toContain("F32_BLOB(768)");
+      expect(schema).toContain("concept_id TEXT PRIMARY KEY");
+      expect(schema).toContain("REFERENCES concepts(id)");
+      expect(schema).toContain("ON DELETE CASCADE");
+    });
+
+    test("concept_embeddings_idx vector index exists", async () => {
+      const program = Effect.gen(function* () {
+        yield* Database;
+        return "db-initialized";
+      });
+
+      const layer = LibSQLDatabase.make({ url: "file::memory:?cache=shared" });
+      await Effect.runPromise(Effect.provide(program, layer));
+
+      const client = createClient({ url: "file::memory:?cache=shared" });
+      const result = await client.execute({
+        sql: "SELECT name FROM sqlite_master WHERE type='index' AND name='concept_embeddings_idx'",
+        args: [],
+      });
+
+      client.close();
+
+      expect(result.rows.length).toBe(1);
+      expect(result.rows[0].name).toBe("concept_embeddings_idx");
     });
   });
 });

@@ -8,6 +8,7 @@
 import { Context, Effect, Layer } from "effect";
 import { createClient, type Client, type InValue } from "@libsql/client";
 import { DatabaseError } from "../types.js";
+import { Ollama } from "./Ollama.js";
 
 // ============================================================================
 // Types
@@ -149,6 +150,17 @@ export interface TaxonomyService {
   readonly seedFromJSON: (
     taxonomy: TaxonomyJSON
   ) => Effect.Effect<void, TaxonomyError>;
+
+  // Concept Embeddings (vector search)
+  readonly storeConceptEmbedding: (
+    conceptId: string,
+    embedding: number[]
+  ) => Effect.Effect<void, TaxonomyError>;
+  readonly findSimilarConcepts: (
+    embedding: number[],
+    threshold?: number,
+    limit?: number
+  ) => Effect.Effect<Concept[], TaxonomyError>;
 }
 
 export const TaxonomyService = Context.GenericTag<TaxonomyService>(
@@ -201,6 +213,8 @@ export class TaxonomyServiceImpl {
    * @param config - LibSQL client configuration
    *   - url: ":memory:" for in-memory, "file:./path.db" for local file, or remote URL
    *   - authToken: Optional auth token for Turso/remote databases
+   *
+   * Requires: Ollama service for embedding generation
    */
   static make(config: { url: string; authToken?: string }) {
     return Layer.scoped(
@@ -569,11 +583,86 @@ export class TaxonomyServiceImpl {
                 }
               }
             }).pipe(Effect.mapError(mapError)),
+
+          // ======================================================================
+          // Concept Embeddings (Vector Search)
+          // ======================================================================
+
+          storeConceptEmbedding: (conceptId, embedding) =>
+            Effect.gen(function* () {
+              // Store embedding as F32_BLOB using vector32() function
+              yield* execute(
+                `INSERT INTO concept_embeddings (concept_id, embedding)
+             VALUES (?, vector32(?))
+             ON CONFLICT (concept_id) DO UPDATE SET
+               embedding = excluded.embedding`,
+                [conceptId, JSON.stringify(embedding)]
+              );
+            }).pipe(Effect.mapError(mapError)),
+
+          findSimilarConcepts: (embedding, threshold = 0.85, limit = 5) =>
+            Effect.gen(function* () {
+              const queryVec = JSON.stringify(embedding);
+
+              // Use vector_top_k with DiskANN index for fast ANN search
+              // Convert distance to similarity score: score = 1 - distance/2
+              // Filter by threshold: if score >= threshold, then distance <= 2*(1-threshold)
+              const maxDistance = 2 * (1 - threshold);
+
+              const result = yield* execute(
+                `SELECT 
+                c.id,
+                c.pref_label,
+                c.alt_labels,
+                c.definition,
+                c.created_at,
+                vector_distance_cos(e.embedding, vector32(?)) as distance
+              FROM vector_top_k('concept_embeddings_idx', vector32(?), ?) AS top
+              JOIN concept_embeddings e ON e.rowid = top.id
+              JOIN concepts c ON c.id = e.concept_id
+              WHERE vector_distance_cos(e.embedding, vector32(?)) <= ?
+              ORDER BY distance ASC`,
+                [queryVec, queryVec, limit * 2, queryVec, maxDistance]
+              );
+
+              return result.rows.map((row) =>
+                parseConceptRow(row as Parameters<typeof parseConceptRow>[0])
+              );
+            }).pipe(Effect.mapError(mapError)),
         });
       })
     );
   }
 }
+
+/**
+ * Generate embedding for a concept using Ollama
+ * Standalone function that requires Ollama service
+ */
+export const generateConceptEmbedding = (concept: Concept) =>
+  Effect.gen(function* () {
+    const ollama = yield* Ollama;
+
+    // Create text from prefLabel + definition for embedding
+    // This ensures concepts are embedded in the same vector space as documents
+    const text = concept.definition
+      ? `${concept.prefLabel}: ${concept.definition}`
+      : concept.prefLabel;
+
+    // Generate embedding using Ollama
+    const embedding = yield* ollama.embed(text);
+
+    return embedding;
+  }).pipe(
+    Effect.mapError(
+      (e): TaxonomyError =>
+        new TaxonomyError(
+          `Failed to generate embedding: ${
+            e._tag === "OllamaError" ? e.reason : String(e)
+          }`
+        )
+    )
+  );
 
 /**
  * Default TaxonomyService layer - for testing with in-memory DB

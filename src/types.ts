@@ -41,6 +41,14 @@ export class PDFChunk extends Schema.Class<PDFChunk>("PDFChunk")({
   content: Schema.String,
 }) {}
 
+/**
+ * Entity type discriminator for unified search results
+ */
+export type EntityType = "document" | "concept";
+
+/**
+ * @deprecated Use DocumentSearchResult for unified search. Kept for backwards compatibility.
+ */
 export class SearchResult extends Schema.Class<SearchResult>("SearchResult")({
   docId: Schema.String,
   title: Schema.String,
@@ -56,6 +64,46 @@ export class SearchResult extends Schema.Class<SearchResult>("SearchResult")({
     Schema.Struct({ start: Schema.Number, end: Schema.Number })
   ),
 }) {}
+
+/**
+ * Document search result with entity type discriminator
+ */
+export class DocumentSearchResult extends Schema.Class<DocumentSearchResult>(
+  "DocumentSearchResult"
+)({
+  docId: Schema.String,
+  title: Schema.String,
+  page: Schema.Number,
+  chunkIndex: Schema.Number,
+  content: Schema.String,
+  score: Schema.Number,
+  matchType: Schema.Literal("vector", "fts", "hybrid"),
+  entityType: Schema.Literal("document"),
+  /** Expanded context around the match (only populated when expandChars > 0) */
+  expandedContent: Schema.optional(Schema.String),
+  /** Range of chunk indices included in expandedContent */
+  expandedRange: Schema.optional(
+    Schema.Struct({ start: Schema.Number, end: Schema.Number })
+  ),
+}) {}
+
+/**
+ * Concept search result from taxonomy/SKOS
+ */
+export class ConceptSearchResult extends Schema.Class<ConceptSearchResult>(
+  "ConceptSearchResult"
+)({
+  conceptId: Schema.String,
+  prefLabel: Schema.String,
+  definition: Schema.String,
+  score: Schema.Number,
+  entityType: Schema.Literal("concept"),
+}) {}
+
+/**
+ * Unified search result - can be either document or concept
+ */
+export type UnifiedSearchResult = DocumentSearchResult | ConceptSearchResult;
 
 // ============================================================================
 // Configuration
@@ -107,6 +155,10 @@ export class SearchOptions extends Schema.Class<SearchOptions>("SearchOptions")(
     hybrid: Schema.optionalWith(Schema.Boolean, { default: () => true }),
     /** Max chars for expanded context per result. 0 = no expansion (default) */
     expandChars: Schema.optionalWith(Schema.Number, { default: () => 0 }),
+    /** Filter by entity types. Default: both documents and concepts */
+    entityTypes: Schema.optional(
+      Schema.Array(Schema.Literal("document", "concept"))
+    ),
   }
 ) {}
 
