@@ -73,7 +73,7 @@ export class LibraryConfig extends Schema.Class<LibraryConfig>("LibraryConfig")(
 ) {
   static readonly Default = new LibraryConfig({
     libraryPath: `${process.env.HOME}/Documents/.pdf-library`,
-    dbPath: `${process.env.HOME}/Documents/.pdf-library/pdf-brain.db`,
+    dbPath: `${process.env.HOME}/Documents/.pdf-library/library.db`,
     ollamaModel: process.env.OLLAMA_MODEL || "mxbai-embed-large",
     ollamaHost: process.env.OLLAMA_HOST || "http://localhost:11434",
     chunkSize: 512,
@@ -86,7 +86,7 @@ export class LibraryConfig extends Schema.Class<LibraryConfig>("LibraryConfig")(
       `${process.env.HOME}/Documents/.pdf-library`;
     return new LibraryConfig({
       libraryPath,
-      dbPath: `${libraryPath}/pdf-brain.db`,
+      dbPath: `${libraryPath}/library.db`,
       ollamaModel: process.env.OLLAMA_MODEL || "mxbai-embed-large",
       ollamaHost: process.env.OLLAMA_HOST || "http://localhost:11434",
       chunkSize: 512,
