@@ -354,10 +354,14 @@ ${
     if (result._tag === "Right") {
       succeeded++;
       const doc = result.right;
+
+      // Checkpoint after EVERY file - slow but crash-safe
+      yield* Effect.either(library.checkpoint());
+
       console.log(
         `   ✅ Added: ${doc.id} (${doc.pageCount} pages, ${formatDuration(
           elapsed
-        )})`
+        )}) 💾`
       );
     } else {
       failed++;
@@ -367,15 +371,6 @@ ${
           ? (err as { message: string }).message
           : String(err);
       console.log(`   ❌ Failed: ${truncate(msg, 50)}`);
-    }
-
-    // Checkpoint every 10
-    if ((i + 1) % 10 === 0) {
-      yield* Effect.either(library.checkpoint());
-      const stats = yield* library.stats();
-      console.log(
-        `\n   💾 Checkpoint: ${stats.documents} docs, ${stats.embeddings} embeddings`
-      );
     }
   }
 
