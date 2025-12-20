@@ -40,6 +40,7 @@ import {
   LibraryConfig,
   URLFetchError,
 } from "./index.js";
+import { Config, loadConfig, saveConfig } from "./types.js";
 import { Migration, MigrationLive } from "./services/Migration.js";
 import {
   TaxonomyService,
@@ -444,6 +445,10 @@ Commands:
 
   stats                   Show library statistics
                           Documents, chunks, embeddings count
+
+  config show             Display all configuration settings
+  config get <path>       Get specific config value (e.g. embedding.model)
+  config set <path> <val> Set specific config value
 
   check                   Verify Ollama is running and model available
 
@@ -882,6 +887,116 @@ const program = Effect.gen(function* () {
       yield* Console.log(`Chunks:     ${stats.chunks}`);
       yield* Console.log(`Embeddings: ${stats.embeddings}`);
       yield* Console.log(`Location:   ${stats.libraryPath}`);
+      break;
+    }
+
+    case "config": {
+      const subcommand = args[1];
+      const config = loadConfig();
+      const libraryPath =
+        process.env.PDF_LIBRARY_PATH ||
+        `${process.env.HOME}/Documents/.pdf-library`;
+      const configPath = `${libraryPath}/config.json`;
+
+      if (!subcommand || subcommand === "show") {
+        // Show all config
+        yield* Console.log(`PDF Library Config (${configPath})`);
+        yield* Console.log(
+          `───────────────────────────────────────────────────────────────────`
+        );
+        yield* Console.log(
+          `Embedding:   ${config.embedding.provider} / ${config.embedding.model}`
+        );
+        yield* Console.log(
+          `Enrichment:  ${config.enrichment.provider} / ${config.enrichment.model}`
+        );
+        yield* Console.log(
+          `Judge:       ${config.judge.provider} / ${config.judge.model}`
+        );
+        yield* Console.log("");
+        yield* Console.log(
+          `Ollama:      ${config.ollama.host} (auto-install: ${
+            config.ollama.autoInstall ? "on" : "off"
+          })`
+        );
+        yield* Console.log("");
+        yield* Console.log(
+          `Note: API keys read from env vars (AI_GATEWAY_API_KEY)`
+        );
+      } else if (subcommand === "get") {
+        const path = args[2];
+        if (!path) {
+          yield* Console.error("Error: Path required");
+          yield* Console.error("Usage: pdf-brain config get <path>");
+          yield* Console.error("Example: pdf-brain config get embedding.model");
+          process.exit(1);
+        }
+
+        // Navigate config object by path (e.g., "embedding.model")
+        const parts = path.split(".");
+        let value: any = config;
+        for (const part of parts) {
+          if (value && typeof value === "object" && part in value) {
+            value = (value as any)[part];
+          } else {
+            yield* Console.error(`Config path not found: ${path}`);
+            process.exit(1);
+          }
+        }
+
+        yield* Console.log(
+          typeof value === "object" ? JSON.stringify(value) : String(value)
+        );
+      } else if (subcommand === "set") {
+        const path = args[2];
+        const newValue = args[3];
+
+        if (!path || newValue === undefined) {
+          yield* Console.error("Error: Path and value required");
+          yield* Console.error("Usage: pdf-brain config set <path> <value>");
+          yield* Console.error(
+            "Example: pdf-brain config set embedding.model nomic-embed-text"
+          );
+          process.exit(1);
+        }
+
+        // Navigate and update config
+        const parts = path.split(".");
+        let target: any = config;
+        for (let i = 0; i < parts.length - 1; i++) {
+          const part = parts[i];
+          if (target && typeof target === "object" && part in target) {
+            target = (target as any)[part];
+          } else {
+            yield* Console.error(`Config path not found: ${path}`);
+            process.exit(1);
+          }
+        }
+
+        const lastPart = parts[parts.length - 1];
+        if (target && typeof target === "object" && lastPart in target) {
+          // Type coercion: boolean or string
+          const oldValue = (target as any)[lastPart];
+          let parsedValue: any = newValue;
+
+          if (typeof oldValue === "boolean") {
+            parsedValue = newValue === "true" || newValue === "1";
+          } else if (typeof oldValue === "number") {
+            parsedValue = parseFloat(newValue);
+          }
+
+          (target as any)[lastPart] = parsedValue;
+          saveConfig(config);
+          yield* Console.log(`✓ Updated ${path}: ${parsedValue}`);
+        } else {
+          yield* Console.error(`Config path not found: ${path}`);
+          process.exit(1);
+        }
+      } else {
+        yield* Console.error(`Unknown config subcommand: ${subcommand}`);
+        yield* Console.error("Available: show, get, set");
+        process.exit(1);
+      }
       break;
     }
 

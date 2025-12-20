@@ -4,12 +4,12 @@
  *
  * This script:
  * 1. Adds the concept_embeddings table if it doesn't exist
- * 2. Generates embeddings for all concepts using Ollama nomic-embed-text
+ * 2. Generates embeddings for all concepts using Ollama mxbai-embed-large
  * 3. Stores embeddings in the same vector space as document chunks
  *
  * Prerequisites:
  *   - Ollama running: ollama serve
- *   - Embedding model: ollama pull nomic-embed-text
+ *   - Embedding model: ollama pull mxbai-embed-large
  *
  * Usage:
  *   bun run scripts/migration/add-concept-embeddings.ts [db-path]
@@ -22,8 +22,8 @@ import { createClient } from "@libsql/client";
 import { join } from "path";
 
 const OLLAMA_HOST = process.env.OLLAMA_HOST || "http://localhost:11434";
-const OLLAMA_MODEL = "nomic-embed-text"; // Hardcoded - must match document embeddings
-const EMBEDDING_DIM = 768; // nomic-embed-text dimension
+const OLLAMA_MODEL = "mxbai-embed-large"; // Hardcoded - must match document embeddings
+const EMBEDDING_DIM = 1024; // mxbai-embed-large dimension
 const BATCH_SIZE = 5; // Process 5 concepts at a time
 
 const args = process.argv.slice(2);

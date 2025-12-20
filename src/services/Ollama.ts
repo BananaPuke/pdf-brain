@@ -11,7 +11,8 @@ import {
   Chunk,
   Stream,
 } from "effect";
-import { OllamaError, LibraryConfig } from "../types.js";
+import { OllamaError, loadConfig } from "../types.js";
+import { spawn } from "child_process";
 
 // ============================================================================
 // Service Definition
@@ -42,7 +43,7 @@ interface OllamaTagsResponse {
 }
 
 /**
- * Expected embedding dimension for nomic-embed-text model
+ * Expected embedding dimension for mxbai-embed-large model
  */
 const EXPECTED_EMBEDDING_DIMENSION = 1024;
 
@@ -86,20 +87,68 @@ function validateEmbedding(
   return Effect.succeed(embedding);
 }
 
+/**
+ * Auto-install a model using `ollama pull`
+ * @param model - Model name to install
+ * @param host - Ollama host URL
+ */
+function autoInstallModel(
+  model: string,
+  host: string
+): Effect.Effect<void, OllamaError> {
+  console.log(`[Ollama] Installing model ${model}...`);
+
+  return Effect.tryPromise({
+    try: () =>
+      new Promise<void>((resolve, reject) => {
+        const proc = spawn("ollama", ["pull", model], {
+          stdio: "inherit",
+        });
+
+        proc.on("close", (code) => {
+          if (code === 0) {
+            console.log("[Ollama] Model installed successfully");
+            resolve();
+          } else {
+            reject(
+              new Error(
+                `ollama pull exited with code ${code}. Ensure Ollama is running and the model name is valid.`
+              )
+            );
+          }
+        });
+
+        proc.on("error", (err) => {
+          reject(
+            new Error(
+              `Failed to spawn ollama pull: ${err.message}. Ensure Ollama CLI is installed.`
+            )
+          );
+        });
+      }),
+    catch: (e) =>
+      new OllamaError({
+        reason: `Auto-install failed: ${
+          e instanceof Error ? e.message : String(e)
+        }`,
+      }),
+  });
+}
+
 export const OllamaLive = Layer.effect(
   Ollama,
   Effect.gen(function* () {
-    const config = LibraryConfig.fromEnv();
+    const config = loadConfig();
 
     const embedSingle = (text: string): Effect.Effect<number[], OllamaError> =>
       Effect.gen(function* () {
         const response = yield* Effect.tryPromise({
           try: () =>
-            fetch(`${config.ollamaHost}/api/embeddings`, {
+            fetch(`${config.ollama.host}/api/embeddings`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({
-                model: config.ollamaModel,
+                model: config.embedding.model,
                 prompt: text,
               }),
             }),
@@ -144,10 +193,10 @@ export const OllamaLive = Layer.effect(
       checkHealth: () =>
         Effect.gen(function* () {
           const response = yield* Effect.tryPromise({
-            try: () => fetch(`${config.ollamaHost}/api/tags`),
+            try: () => fetch(`${config.ollama.host}/api/tags`),
             catch: () =>
               new OllamaError({
-                reason: `Cannot connect to Ollama at ${config.ollamaHost}`,
+                reason: `Cannot connect to Ollama at ${config.ollama.host}`,
               }),
           });
 
@@ -163,18 +212,22 @@ export const OllamaLive = Layer.effect(
               new OllamaError({ reason: "Invalid response from Ollama" }),
           });
 
+          const modelName = config.embedding.model;
           const hasModel = data.models.some(
-            (m) =>
-              m.name === config.ollamaModel ||
-              m.name.startsWith(`${config.ollamaModel}:`)
+            (m) => m.name === modelName || m.name.startsWith(`${modelName}:`)
           );
 
           if (!hasModel) {
-            return yield* Effect.fail(
-              new OllamaError({
-                reason: `Model ${config.ollamaModel} not found. Run: ollama pull ${config.ollamaModel}`,
-              })
-            );
+            if (config.ollama.autoInstall) {
+              // Auto-install the model
+              yield* autoInstallModel(modelName, config.ollama.host);
+            } else {
+              return yield* Effect.fail(
+                new OllamaError({
+                  reason: `Model ${modelName} not found. Run: ollama pull ${modelName}`,
+                })
+              );
+            }
           }
         }),
     };

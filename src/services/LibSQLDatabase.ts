@@ -10,8 +10,8 @@ import { createClient, type Client } from "@libsql/client";
 import { Database } from "./Database.js";
 import { DatabaseError, Document } from "../types.js";
 
-// Embedding dimension for nomic-embed-text (used for both documents and concepts)
-const EMBEDDING_DIM = 768;
+// Embedding dimension for mxbai-embed-large (used for both documents and concepts)
+const EMBEDDING_DIM = 1024;
 
 // ============================================================================
 // LibSQLDatabase Service

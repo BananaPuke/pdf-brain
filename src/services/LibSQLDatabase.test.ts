@@ -31,10 +31,10 @@ describe("LibSQLDatabase", () => {
       expect(result).toBe("created");
     });
 
-    test("embeddings table uses F32_BLOB(768) column type for nomic-embed-text", async () => {
+    test("embeddings table uses F32_BLOB(1024) column type for mxbai-embed-large", async () => {
       // REGRESSION PREVENTION TEST
       // Root cause: Old PGLite code used TEXT for embeddings.
-      // libSQL requires F32_BLOB(768) for vector search with nomic-embed-text.
+      // libSQL requires F32_BLOB(1024) for vector search with mxbai-embed-large.
       // If TEXT is used, vector search hangs.
       //
       // This test verifies the actual schema by querying sqlite_master
@@ -57,12 +57,12 @@ describe("LibSQLDatabase", () => {
 
       client.close();
 
-      // Verify schema contains F32_BLOB(768), not TEXT
+      // Verify schema contains F32_BLOB(1024), not TEXT
       expect(result.rows.length).toBe(1);
       const schema = result.rows[0].sql as string;
 
-      // CRITICAL: Must use F32_BLOB(768) for libSQL vector operations with nomic-embed-text
-      expect(schema).toContain("F32_BLOB(768)");
+      // CRITICAL: Must use F32_BLOB(1024) for libSQL vector operations with mxbai-embed-large
+      expect(schema).toContain("F32_BLOB(1024)");
 
       // MUST NOT use TEXT (PGLite legacy schema)
       expect(schema).not.toContain("embedding TEXT");
@@ -561,8 +561,8 @@ describe("LibSQLDatabase", () => {
   });
 
   describe("concept embeddings schema", () => {
-    test("concept_embeddings table exists with F32_BLOB(768)", async () => {
-      // RED TEST: Verify concept embeddings use same 768-dim as nomic-embed-text
+    test("concept_embeddings table exists with F32_BLOB(1024)", async () => {
+      // RED TEST: Verify concept embeddings use same 1024-dim as mxbai-embed-large
       const program = Effect.gen(function* () {
         yield* Database; // Force initialization
         return "db-initialized";
@@ -583,8 +583,8 @@ describe("LibSQLDatabase", () => {
       expect(result.rows.length).toBe(1);
       const schema = result.rows[0].sql as string;
 
-      // Verify 768 dimensions (nomic-embed-text)
-      expect(schema).toContain("F32_BLOB(768)");
+      // Verify 1024 dimensions (mxbai-embed-large)
+      expect(schema).toContain("F32_BLOB(1024)");
       expect(schema).toContain("concept_id TEXT PRIMARY KEY");
       expect(schema).toContain("REFERENCES concepts(id)");
       expect(schema).toContain("ON DELETE CASCADE");

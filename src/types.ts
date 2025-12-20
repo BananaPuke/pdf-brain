@@ -3,6 +3,8 @@
  */
 
 import { Schema } from "effect";
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
+import { dirname } from "path";
 
 // ============================================================================
 // Domain Models
@@ -141,6 +143,100 @@ export class LibraryConfig extends Schema.Class<LibraryConfig>("LibraryConfig")(
       chunkOverlap: 50,
     });
   }
+}
+
+/**
+ * Multi-provider configuration for embedding, enrichment, and judge models.
+ * Supports both Ollama (local) and AI Gateway (remote) providers.
+ */
+export class Config extends Schema.Class<Config>("Config")({
+  embedding: Schema.Struct({
+    provider: Schema.Literal("ollama", "gateway"),
+    model: Schema.String,
+  }),
+  enrichment: Schema.Struct({
+    provider: Schema.Literal("ollama", "gateway"),
+    model: Schema.String,
+  }),
+  judge: Schema.Struct({
+    provider: Schema.Literal("ollama", "gateway"),
+    model: Schema.String,
+  }),
+  ollama: Schema.Struct({
+    host: Schema.String,
+    autoInstall: Schema.Boolean,
+  }),
+}) {
+  /**
+   * Default configuration: Ollama for all providers
+   */
+  static readonly Default = new Config({
+    embedding: {
+      provider: "ollama" as const,
+      model: "mxbai-embed-large",
+    },
+    enrichment: {
+      provider: "ollama" as const,
+      model: "llama3.2",
+    },
+    judge: {
+      provider: "ollama" as const,
+      model: "llama3.2",
+    },
+    ollama: {
+      host: "http://localhost:11434",
+      autoInstall: true,
+    },
+  });
+}
+
+// ============================================================================
+// Config Helpers
+// ============================================================================
+
+/**
+ * Load config from $PDF_LIBRARY_PATH/config.json.
+ * Creates config.json with defaults if it doesn't exist.
+ */
+export function loadConfig(): Config {
+  const libraryPath =
+    process.env.PDF_LIBRARY_PATH ||
+    `${process.env.HOME}/Documents/.pdf-library`;
+  const configPath = `${libraryPath}/config.json`;
+
+  // Create config file with defaults if missing
+  if (!existsSync(configPath)) {
+    // Ensure directory exists
+    mkdirSync(dirname(configPath), { recursive: true });
+
+    const defaultConfig = Config.Default;
+    writeFileSync(configPath, JSON.stringify(defaultConfig, null, 2), "utf-8");
+    return defaultConfig;
+  }
+
+  // Read and parse existing config
+  const configJson = readFileSync(configPath, "utf-8");
+  const configData = JSON.parse(configJson);
+
+  // Validate and return via Schema
+  return Schema.decodeSync(Config)(configData);
+}
+
+/**
+ * Save config to $PDF_LIBRARY_PATH/config.json.
+ * API keys are never stored - they come from env vars (AI_GATEWAY_API_KEY).
+ */
+export function saveConfig(config: Config): void {
+  const libraryPath =
+    process.env.PDF_LIBRARY_PATH ||
+    `${process.env.HOME}/Documents/.pdf-library`;
+  const configPath = `${libraryPath}/config.json`;
+
+  // Ensure directory exists
+  mkdirSync(dirname(configPath), { recursive: true });
+
+  // Write config (Schema.encode not needed for simple JSON serialization)
+  writeFileSync(configPath, JSON.stringify(config, null, 2), "utf-8");
 }
 
 // ============================================================================

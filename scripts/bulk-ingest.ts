@@ -6,6 +6,11 @@
  * Extracts text from PDFs before enrichment.
  */
 
+// Load .env file
+import { config as loadEnv } from "dotenv";
+import { resolve } from "node:path";
+loadEnv({ path: resolve(import.meta.dir, "../.env") });
+
 import { Effect, Layer, Logger, LogLevel } from "effect";
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { basename, extname, join } from "node:path";
@@ -36,13 +41,23 @@ import { LibraryConfig } from "../src/types.js";
 // ============================================================================
 
 const args = process.argv.slice(2);
-const directories = args.filter((a) => !a.startsWith("--"));
 const tagsIdx = args.indexOf("--tags");
 const manualTags =
   tagsIdx !== -1 ? args[tagsIdx + 1]?.split(",").map((t) => t.trim()) : [];
+const providerIdx = args.indexOf("--provider");
+const provider = providerIdx !== -1 ? args[providerIdx + 1] : undefined;
 const autoTag = args.includes("--auto-tag");
 const enrich = args.includes("--enrich");
 const verbose = args.includes("--verbose");
+
+// Filter directories - exclude flags and their values
+const directories = args.filter((a, i) => {
+  if (a.startsWith("--")) return false;
+  // Exclude values that follow --tags or --provider
+  if (i > 0 && (args[i - 1] === "--tags" || args[i - 1] === "--provider"))
+    return false;
+  return true;
+});
 
 if (directories.length === 0) {
   console.log(`
@@ -53,15 +68,16 @@ if (directories.length === 0) {
 Usage: ./scripts/bulk-ingest.ts <dir1> [dir2] [options]
 
 Options:
-  --tags tag1,tag2   Manual tags for all files
-  --auto-tag         Smart tagging (heuristics + light LLM)
-  --enrich           Full enrichment (LLM extracts title/summary/concepts)
-  --verbose          Show detailed logging
+  --tags tag1,tag2       Manual tags for all files
+  --auto-tag             Smart tagging (heuristics + light LLM)
+  --enrich               Full enrichment (LLM extracts title/summary/concepts)
+  --provider <name>      LLM provider: ollama (default) or anthropic
+  --verbose              Show detailed logging
 
 Examples:
   ./scripts/bulk-ingest.ts ~/books --tags "books"
   ./scripts/bulk-ingest.ts ~/papers --auto-tag
-  ./scripts/bulk-ingest.ts ~/docs --enrich
+  ./scripts/bulk-ingest.ts ~/docs --enrich --provider anthropic
 `);
   process.exit(1);
 }
@@ -256,11 +272,14 @@ ${
     if (tagger && (enrich || autoTag)) {
       if (enrich && content) {
         // Full enrichment with LLM
-        console.log("   🔍 Enriching with LLM...");
+        console.log(
+          `   🔍 Enriching with LLM${provider ? ` (${provider})` : ""}...`
+        );
         const enrichResult = yield* Effect.either(
           tagger.enrich(filePath, content, {
             basePath: directories[0],
             availableConcepts,
+            provider: provider as "ollama" | "anthropic" | undefined,
           })
         );
 

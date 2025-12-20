@@ -21,6 +21,7 @@ import {
   generateConceptEmbedding,
 } from "./TaxonomyService.js";
 import { Ollama } from "./Ollama.js";
+import { loadConfig } from "../types.js";
 
 // ============================================================================
 // Types
@@ -586,8 +587,90 @@ function formatConceptsForPrompt(concepts: TaxonomyConcept[]): string {
 }
 
 /**
+ * Use LLM to judge if two concepts are duplicates or distinct
+ * More accurate than pure embedding similarity
+ *
+ * Supports both providers:
+ * - gateway: Uses AI Gateway with configured model (e.g., "anthropic/claude-haiku-4-5")
+ * - ollama: Uses Ollama with configured model (e.g., "llama3.2")
+ */
+async function llmJudgeDuplicate(
+  proposed: ProposedConcept,
+  existing: { id: string; prefLabel: string; definition?: string | null }
+): Promise<{ isDuplicate: boolean; available: boolean }> {
+  const config = loadConfig();
+
+  const prompt = `You are a taxonomy curator. Determine if these two concepts are essentially the SAME concept (duplicates that should be merged) or DISTINCT concepts that both belong in a knowledge taxonomy.
+
+PROPOSED CONCEPT:
+Name: ${proposed.prefLabel}
+Definition: ${proposed.definition || "(no definition)"}
+
+EXISTING CONCEPT:
+Name: ${existing.prefLabel}
+Definition: ${existing.definition || "(no definition)"}
+
+Consider:
+- Are they synonyms or alternate names for the same thing? → DUPLICATE
+- Are they related but represent different ideas, theories, or domains? → DISTINCT
+- Would a subject matter expert consider them separate entries? → DISTINCT
+
+Reply with ONLY one word: DUPLICATE or DISTINCT`;
+
+  if (config.judge.provider === "gateway") {
+    // Try AI Gateway
+    const gatewayKey = process.env.AI_GATEWAY_API_KEY;
+    if (!gatewayKey) {
+      console.log(
+        "  [AutoTagger] AI_GATEWAY_API_KEY not set, LLM judge unavailable"
+      );
+      return { isDuplicate: false, available: false };
+    }
+
+    try {
+      const result = await generateText({
+        model: config.judge.model as any,
+        prompt,
+      });
+      const answer = result.text.trim().toUpperCase();
+      return { isDuplicate: answer.includes("DUPLICATE"), available: true };
+    } catch (e) {
+      console.log(`  [AutoTagger] Gateway LLM judge failed: ${e}`);
+      return { isDuplicate: false, available: false };
+    }
+  } else {
+    // Use Ollama
+    const ollamaHost = config.ollama.host;
+    const ollamaModel = config.judge.model;
+
+    try {
+      const response = await fetch(`${ollamaHost}/api/generate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: ollamaModel,
+          prompt,
+          stream: false,
+        }),
+      });
+
+      if (!response.ok) {
+        return { isDuplicate: false, available: false };
+      }
+
+      const data = (await response.json()) as { response?: string };
+      const answer = (data.response || "").trim().toUpperCase();
+      return { isDuplicate: answer.includes("DUPLICATE"), available: true };
+    } catch (e) {
+      // Ollama not available
+      return { isDuplicate: false, available: false };
+    }
+  }
+}
+
+/**
  * Auto-accept novel proposed concepts after deduplication check
- * Uses embedding similarity to detect duplicates (threshold 0.85)
+ * Uses embedding similarity to find candidates, then LLM to judge duplicates
  *
  * @returns Effect with count of accepted and rejected proposals
  */
@@ -617,16 +700,23 @@ function autoAcceptProposals(
 
       const embedding = yield* ollama.embed(proposalText);
 
-      // Check for duplicates (similarity > 0.85)
-      const similar = yield* taxonomy.findSimilarConcepts(embedding, 0.85);
+      // Find similar concepts (lower threshold for LLM review candidates)
+      const similar = yield* taxonomy.findSimilarConcepts(embedding, 0.75);
 
       if (similar.length > 0) {
-        // Duplicate detected - skip
-        console.log(
-          `  [AutoTagger] Rejected duplicate proposal "${proposal.prefLabel}" (similar to "${similar[0].prefLabel}")`
-        );
-        rejected++;
-        continue;
+        // Use LLM to judge if it's actually a duplicate
+        const judgeResult = yield* Effect.tryPromise({
+          try: () => llmJudgeDuplicate(proposal, similar[0]),
+          catch: () => ({ isDuplicate: false, available: false }),
+        });
+
+        if (judgeResult.isDuplicate) {
+          console.log(
+            `  [AutoTagger] Rejected duplicate: "${proposal.prefLabel}" ≈ "${similar[0].prefLabel}"`
+          );
+          rejected++;
+          continue;
+        }
       }
 
       // Novel concept - accept
@@ -1118,16 +1208,26 @@ export const AutoTaggerLive = Layer.effect(
             `  [AutoTagger] RAG context: ${ragConcepts.length} relevant concepts found`
           );
 
-          // Try local LLM first
-          let provider: LLMProvider = opts.provider || "ollama";
-          let model = opts.model;
+          // Load config for provider/model defaults
+          const config = loadConfig();
+
+          // Use options or fallback to config (map "gateway" to "anthropic" for LLMProvider type)
+          let provider: LLMProvider =
+            opts.provider ||
+            (config.enrichment.provider === "gateway" ? "anthropic" : "ollama");
+          let model: string | undefined = opts.model || config.enrichment.model;
 
           if (provider === "ollama") {
             const available = yield* Effect.promise(() => isOllamaAvailable());
             if (!available) {
-              console.warn("Ollama not available, falling back to Anthropic");
+              console.warn(
+                "Ollama not available, falling back to Anthropic/Gateway"
+              );
               provider = "anthropic";
-              model = undefined;
+              model =
+                config.enrichment.provider === "gateway"
+                  ? config.enrichment.model
+                  : DEFAULT_MODELS.anthropic;
             } else if (!model) {
               // Check if default model is available
               const modelAvailable = yield* Effect.promise(() =>
@@ -1135,9 +1235,13 @@ export const AutoTaggerLive = Layer.effect(
               );
               if (!modelAvailable) {
                 console.warn(
-                  `Model ${DEFAULT_MODELS.ollama} not available, falling back to Anthropic`
+                  `Model ${DEFAULT_MODELS.ollama} not available, falling back to Anthropic/Gateway`
                 );
                 provider = "anthropic";
+                model =
+                  config.enrichment.provider === "gateway"
+                    ? config.enrichment.model
+                    : DEFAULT_MODELS.anthropic;
               }
             }
           }
@@ -1213,8 +1317,16 @@ export const AutoTaggerLive = Layer.effect(
 
           // Add LLM tags if not heuristics-only and we have content
           if (!opts.heuristicsOnly && content) {
-            let provider: LLMProvider = opts.provider || "ollama";
-            let model = opts.model;
+            // Load config for provider/model defaults
+            const config = loadConfig();
+
+            let provider: LLMProvider =
+              opts.provider ||
+              (config.enrichment.provider === "gateway"
+                ? "anthropic"
+                : "ollama");
+            let model: string | undefined =
+              opts.model || config.enrichment.model;
 
             if (provider === "ollama") {
               const available = yield* Effect.promise(() =>
@@ -1222,7 +1334,10 @@ export const AutoTaggerLive = Layer.effect(
               );
               if (!available) {
                 provider = "anthropic";
-                model = undefined;
+                model =
+                  config.enrichment.provider === "gateway"
+                    ? config.enrichment.model
+                    : DEFAULT_MODELS.anthropic;
               }
             }
 

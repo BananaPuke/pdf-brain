@@ -25,6 +25,7 @@
     "@effect/schema": "^0.75.0",
     "@libsql/client": "^0.15.15",
     "ai": "^5.0.115",
+    "dotenv": "^17.2.3",
     "effect": "^3.12.0",
     "gray-matter": "^4.0.3",
     "ink": "^6.5.1",
