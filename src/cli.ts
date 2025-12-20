@@ -424,6 +424,7 @@ Commands:
   add <path|url>          Add a PDF or Markdown file (local path or URL)
     --title <title>       Custom title (default: filename or frontmatter)
     --tags <tags>         Comma-separated tags
+    --no-enrich           Skip LLM enrichment (title/summary/tags extraction)
 
   search <query>          Unified search across documents and concepts
     --limit <n>           Max results (default: 10)
@@ -599,8 +600,8 @@ const program = Effect.gen(function* () {
 
       yield* Console.log(`Adding: ${localPath}`);
 
-      // Handle --enrich flag
-      const enrich = opts.enrich === true;
+      // Enrich by default unless --no-enrich is passed
+      const enrich = opts["no-enrich"] !== true;
       const forceProvider = opts.provider as "ollama" | "anthropic" | undefined;
       let enrichedTitle = title;
       let enrichedTags = tags || [];
