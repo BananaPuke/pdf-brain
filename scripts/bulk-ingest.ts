@@ -300,6 +300,9 @@ ${
             );
             process.exit(1);
           }
+
+          // Log the actual error so we can debug
+          console.log(`   ⚠️  Enrichment failed: ${errMsg}`);
         }
 
         if (enrichResult._tag === "Right") {

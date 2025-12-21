@@ -1247,6 +1247,7 @@ export const AutoTaggerLive = Layer.effect(
           }
 
           // STEP 2: Run enrichment with RAG-enhanced concept list
+          // If LLM fails (schema mismatch, JSON parse error, etc.), fall back to heuristics
           const result = yield* Effect.tryPromise({
             try: () =>
               enrichWithLLM(
@@ -1263,7 +1264,34 @@ export const AutoTaggerLive = Layer.effect(
                 }`,
                 error
               ),
-          });
+          }).pipe(
+            Effect.catchAll((error) => {
+              // Log the actual error for debugging
+              console.warn(
+                `  [AutoTagger] LLM enrichment failed: ${error.message}`
+              );
+              console.warn(`  [AutoTagger] Falling back to heuristics`);
+
+              // Fall back to heuristics instead of failing
+              const pathTags = extractPathTags(filePath, opts.basePath);
+              const filenameTags = extractFilenameTags(filename);
+              const contentTags = extractContentKeywords(content, 5);
+
+              return Effect.succeed({
+                title: cleanTitle(filename),
+                author: extractAuthor(filename),
+                summary:
+                  content.slice(0, 200).replace(/\s+/g, " ").trim() + "...",
+                documentType: "other" as DocumentType,
+                category: pathTags[0] || "uncategorized",
+                tags: [
+                  ...new Set([...pathTags, ...filenameTags, ...contentTags]),
+                ].slice(0, 10),
+                concepts: [],
+                proposedConcepts: undefined,
+              });
+            })
+          );
 
           // STEP 3: Auto-accept novel proposed concepts
           const validatedProposals = result.proposedConcepts || [];
